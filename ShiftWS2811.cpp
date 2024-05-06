@@ -36,17 +36,15 @@
 // the more interrupt latency ShiftWS2811 can tolerate, but the transmit
 // buffer grows in size.  For good performance, the buffer should be kept
 // smaller than the half the Cortex-M7 data cache.
-#define BYTES_PER_DMA 40
+#define BYTES_PER_DMA 2
 
-uint8_t ShiftWS2811::defaultPinList[8] = {2, 14, 7, 8, 6, 20, 21, 5};
+uint8_t ShiftWS2811::defaultPinList[8] = {16, 17, 18, 19, 20, 21, 22, 23};
 uint16_t ShiftWS2811::stripLen;
 // uint8_t ShiftWS2811::brightness = 255;
 void *ShiftWS2811::frameBuffer;
 void *ShiftWS2811::drawBuffer;
 uint8_t ShiftWS2811::params;
-DMAChannel ShiftWS2811::dma1;
 DMAChannel ShiftWS2811::dma2;
-DMAChannel ShiftWS2811::dma3;
 static DMASetting dma2next;
 static uint32_t numbytes;
 
@@ -55,13 +53,15 @@ static uint8_t pinlist[NUM_DIGITAL_PINS];  // = {2, 14, 7, 8, 6, 20, 21, 5};
 static uint8_t pin_bitnum[NUM_DIGITAL_PINS];
 static uint8_t pin_offset[NUM_DIGITAL_PINS];
 
-static uint16_t comp1load[3];
 DMAMEM static uint32_t bitmask[4] __attribute__((used, aligned(32)));
-DMAMEM static uint32_t bitdata[BYTES_PER_DMA * 64] __attribute__((used, aligned(32)));
+// *8 for 8 bits in a byte, *8 for 8 bits in a SR, *3 for WS2811 waveform, *2 for circular buffer (filling buffer while DMA sends the other half)
+DMAMEM static uint32_t bitdata[BYTES_PER_DMA * 8 * 8 * 3 * 2] __attribute__((used, aligned(32)));
 volatile uint32_t framebuffer_index = 0;
 volatile bool dma_first;
 
 static uint32_t update_begin_micros = 0;
+static elapsedMicros sinceFinish = 0;
+static volatile bool transferring = false;
 
 ShiftWS2811::ShiftWS2811(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config, uint8_t numPins, const uint8_t *pinList) {
   stripLen = numPerStrip;
@@ -94,6 +94,7 @@ static volatile uint32_t *standard_gpio_addr(volatile uint32_t *fastgpio) {
 }
 
 void ShiftWS2811::begin(void) {
+  transferring = false;
   if ((params & 0x1F) < 6) {
     numbytes = stripLen * 3;  // RGB formats
   } else {
@@ -117,96 +118,61 @@ void ShiftWS2811::begin(void) {
   }
   arm_dcache_flush_delete(bitmask, sizeof(bitmask));
 
-  // Set up 3 timers to create waveform timing events
-  comp1load[0] = (uint16_t)((float)F_BUS_ACTUAL * (float)TH_TL);
-  comp1load[1] = (uint16_t)((float)F_BUS_ACTUAL * (float)T0H);
-  comp1load[2] = (uint16_t)((float)F_BUS_ACTUAL * (float)T1H);
-  if ((params & 0xC0) == WS2811_400kHz) {
-    comp1load[0] *= 2;
-    comp1load[1] *= 2;
-    comp1load[2] *= 2;
-  }
-  TMR4_ENBL &= ~7;
-  TMR4_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_FORCE | TMR_SCTRL_MSTR;
-  TMR4_CSCTRL0 = TMR_CSCTRL_CL1(1) | TMR_CSCTRL_TCF1EN;
-  TMR4_CNTR0 = 0;
-  TMR4_LOAD0 = 0;
-  TMR4_COMP10 = comp1load[0];
-  TMR4_CMPLD10 = comp1load[0];
-  TMR4_CTRL0 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(3);
-  TMR4_SCTRL1 = TMR_SCTRL_OEN | TMR_SCTRL_FORCE;
-  TMR4_CNTR1 = 0;
-  TMR4_LOAD1 = 0;
-  TMR4_COMP11 = comp1load[1];  // T0H
-  TMR4_CMPLD11 = comp1load[1];
-  TMR4_CTRL1 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_COINIT | TMR_CTRL_OUTMODE(3);
-  TMR4_SCTRL2 = TMR_SCTRL_OEN | TMR_SCTRL_FORCE;
-  TMR4_CNTR2 = 0;
-  TMR4_LOAD2 = 0;
-  TMR4_COMP12 = comp1load[2];  // T1H
-  TMR4_CMPLD12 = comp1load[2];
-  TMR4_CTRL2 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_COINIT | TMR_CTRL_OUTMODE(3);
+  //----------------- TIMERS/CLOCKS ----------------------
+  // pin 14 (TMR3.2) & 15 (TMR3.3)
+
+  TMR3_ENBL = 0;  // turn off all timers
+
+  TMR3_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_FORCE;
+  TMR3_CSCTRL0 = 0;  // reset to 0, is set by pwm init code otherwise
+  // TMR3_CNTR0 = 0;
+  TMR3_LOAD0 = 0;
+  TMR3_COMP10 = 14;                                                                       // 700KHz resulting WS2811 frequency
+  TMR3_CTRL0 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(3);  // Timer Channel Control Register p.3079
+  // Count Mode: Count rising edges of primary source | Primary Count Source: IP bus clock divide by 1 prescaler
+  // | Count Length: Count until compare, then re-initialize | Output Mode: Toggle OFLAG output on successful compare
+
+  // SHIFT CLOCK
+  TMR3_SCTRL3 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;  // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
+  TMR3_CSCTRL3 = 0;                                                               // Timer Channel Comparator Status and Control Register  // reset to 0, is set by pwm init code otherwise
+  // TMR3_CNTR3 = 7;
+  TMR3_LOAD3 = 65537 - 8;                                                                 // low time  (65537 - x) -
+  TMR3_COMP13 = 7;                                                                        // high time (0 = always low, max = LOAD-1)
+  TMR3_CTRL3 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register // .... | Output Mode: Set on compare, cleared on counter rollover
+  *(portConfigRegister(15)) = 1;                                                          // set pin 15 to output TMR3 ch1 OFLAG
+
+  // STORE CLOCK
+  TMR3_SCTRL2 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;  // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
+  TMR3_CSCTRL2 = 0;                                                               // reset to 0, is set by pwm init code otherwise
+  // TMR3_CNTR2 = 65537 - 32;
+  TMR3_LOAD2 = 65537 - 110;                                                               // low time  (65537 - x) -
+  TMR3_COMP12 = 10;                                                                       // high time (0 = always low, max = LOAD-1)
+  TMR3_CTRL2 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register
+  *(portConfigRegister(14)) = 1;                                                          // set pin 14 to output TMR3 ch1 OFLAG
 
   // route the timer outputs through XBAR to edge trigger DMA request
   CCM_CCGR2 |= CCM_CCGR2_XBAR1(CCM_CCGR_ON);
-  xbar_connect(XBARA1_IN_QTIMER4_TIMER0, XBARA1_OUT_DMA_CH_MUX_REQ30);
-  xbar_connect(XBARA1_IN_QTIMER4_TIMER1, XBARA1_OUT_DMA_CH_MUX_REQ31);
-  xbar_connect(XBARA1_IN_QTIMER4_TIMER2, XBARA1_OUT_DMA_CH_MUX_REQ94);
-  XBARA1_CTRL0 = XBARA_CTRL_STS1 | XBARA_CTRL_EDGE1(3) | XBARA_CTRL_DEN1 |
-                 XBARA_CTRL_STS0 | XBARA_CTRL_EDGE0(3) | XBARA_CTRL_DEN0;
-  XBARA1_CTRL1 = XBARA_CTRL_STS0 | XBARA_CTRL_EDGE0(3) | XBARA_CTRL_DEN0;
+  xbar_connect(XBARA1_IN_QTIMER3_TIMER0, XBARA1_OUT_DMA_CH_MUX_REQ30);
+
+  XBARA1_CTRL0 = XBARA_CTRL_STS0 | XBARA_CTRL_EDGE0(3) | XBARA_CTRL_DEN0;
 
   // configure DMA channels
-  dma1.begin();
-  dma1.TCD->SADDR = bitmask;
-  dma1.TCD->SOFF = 8;
-  dma1.TCD->ATTR = DMA_TCD_ATTR_SSIZE(3) | DMA_TCD_ATTR_SMOD(4) | DMA_TCD_ATTR_DSIZE(2);
-  dma1.TCD->NBYTES_MLOFFYES = DMA_TCD_NBYTES_DMLOE |
-                              DMA_TCD_NBYTES_MLOFFYES_MLOFF(-65536) |
-                              DMA_TCD_NBYTES_MLOFFYES_NBYTES(16);
-  dma1.TCD->SLAST = 0;
-  dma1.TCD->DADDR = &GPIO1_DR_SET;
-  dma1.TCD->DOFF = 16384;
-  dma1.TCD->CITER_ELINKNO = numbytes * 8;
-  dma1.TCD->DLASTSGA = -65536;
-  dma1.TCD->BITER_ELINKNO = numbytes * 8;
-  dma1.TCD->CSR = DMA_TCD_CSR_DREQ;
-  dma1.triggerAtHardwareEvent(DMAMUX_SOURCE_XBAR1_0);
-
   dma2next.TCD->SADDR = bitdata;
-  dma2next.TCD->SOFF = 8;
-  dma2next.TCD->ATTR = DMA_TCD_ATTR_SSIZE(3) | DMA_TCD_ATTR_DSIZE(2);
-  dma2next.TCD->NBYTES_MLOFFYES = DMA_TCD_NBYTES_DMLOE |
-                                  DMA_TCD_NBYTES_MLOFFYES_MLOFF(-65536) |
-                                  DMA_TCD_NBYTES_MLOFFYES_NBYTES(16);
+  dma2next.TCD->SOFF = 4;
+  dma2next.TCD->ATTR = DMA_TCD_ATTR_SSIZE(2) | DMA_TCD_ATTR_DSIZE(2);
+  dma2next.TCD->NBYTES_MLOFFYES = DMA_TCD_NBYTES_MLOFFYES_NBYTES(4);
   dma2next.TCD->SLAST = 0;
-  dma2next.TCD->DADDR = &GPIO1_DR_CLEAR;
-  dma2next.TCD->DOFF = 16384;
-  dma2next.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8;
+  dma2next.TCD->DADDR = &GPIO1_DR;
+  dma2next.TCD->DOFF = 0;
+  dma2next.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8 * 3 - 1;
   dma2next.TCD->DLASTSGA = (int32_t)(dma2next.TCD);
-  dma2next.TCD->BITER_ELINKNO = BYTES_PER_DMA * 8;
-  dma2next.TCD->CSR = 0;
+  dma2next.TCD->BITER_ELINKNO = BYTES_PER_DMA * 8 * 3 - 1;
+  dma2next.TCD->CSR = DMA_TCD_CSR_DONE;
 
   dma2.begin();
   dma2 = dma2next;  // copies TCD
-  dma2.triggerAtHardwareEvent(DMAMUX_SOURCE_XBAR1_1);
+  dma2.triggerAtHardwareEvent(DMAMUX_SOURCE_XBAR1_0);
   dma2.attachInterrupt(isr);
-
-  dma3.begin();
-  dma3.TCD->SADDR = bitmask;
-  dma3.TCD->SOFF = 8;
-  dma3.TCD->ATTR = DMA_TCD_ATTR_SSIZE(3) | DMA_TCD_ATTR_SMOD(4) | DMA_TCD_ATTR_DSIZE(2);
-  dma3.TCD->NBYTES_MLOFFYES = DMA_TCD_NBYTES_DMLOE |
-                              DMA_TCD_NBYTES_MLOFFYES_MLOFF(-65536) |
-                              DMA_TCD_NBYTES_MLOFFYES_NBYTES(16);
-  dma3.TCD->SLAST = 0;
-  dma3.TCD->DADDR = &GPIO1_DR_CLEAR;
-  dma3.TCD->DOFF = 16384;
-  dma3.TCD->CITER_ELINKNO = numbytes * 8;
-  dma3.TCD->DLASTSGA = -65536;
-  dma3.TCD->BITER_ELINKNO = numbytes * 8;
-  dma3.TCD->CSR = DMA_TCD_CSR_DREQ | DMA_TCD_CSR_DONE;
-  dma3.triggerAtHardwareEvent(DMAMUX_SOURCE_XBAR1_2);
 
   // set up the buffers
   uint32_t bufsize = numbytes * numpins;
@@ -216,49 +182,76 @@ void ShiftWS2811::begin(void) {
   } else {
     drawBuffer = frameBuffer;
   }
+
+  for (uint i = 0; i < sizeof(bitdata) / 4; i++) {
+    bitdata[i] = i % 24 < 8 ? bitmask[0] : 0;
+  }
+  arm_dcache_flush_delete(bitdata, sizeof(bitdata));
 }
 
 static void fillbits(uint32_t *dest, const uint8_t *pixels, int n, uint32_t mask) {
   do {
     uint8_t pix = *pixels++;
-    if (!(pix & 0x80)) *dest |= mask;
-    dest += 4;
-    if (!(pix & 0x40)) *dest |= mask;
-    dest += 4;
-    if (!(pix & 0x20)) *dest |= mask;
-    dest += 4;
-    if (!(pix & 0x10)) *dest |= mask;
-    dest += 4;
-    if (!(pix & 0x08)) *dest |= mask;
-    dest += 4;
-    if (!(pix & 0x04)) *dest |= mask;
-    dest += 4;
-    if (!(pix & 0x02)) *dest |= mask;
-    dest += 4;
-    if (!(pix & 0x01)) *dest |= mask;
-    dest += 4;
+    if ((pix & 0x80))
+      *dest |= mask;
+    else
+      *dest &= ~mask;
+    dest += 24;  // *8 for pins on SR, *3 for WS2811 waveform (=24)
+    if ((pix & 0x40))
+      *dest |= mask;
+    else
+      *dest &= ~mask;
+    dest += 24;
+    if ((pix & 0x20))
+      *dest |= mask;
+    else
+      *dest &= ~mask;
+    dest += 24;
+    if ((pix & 0x10))
+      *dest |= mask;
+    else
+      *dest &= ~mask;
+    dest += 24;
+    if ((pix & 0x08))
+      *dest |= mask;
+    else
+      *dest &= ~mask;
+    dest += 24;
+    if ((pix & 0x04))
+      *dest |= mask;
+    else
+      *dest &= ~mask;
+    dest += 24;
+    if ((pix & 0x02))
+      *dest |= mask;
+    else
+      *dest &= ~mask;
+    dest += 24;
+    if ((pix & 0x01))
+      *dest |= mask;
+    else
+      *dest &= ~mask;
+    dest += 24;
   } while (--n > 0);
 }
 
 void ShiftWS2811::show(void) {
   // wait for any prior DMA operation
-  while (!dma3.complete())
+  while (transferring)
     ;  // wait
 
   // it's ok to copy the drawing buffer to the frame buffer
   // during the 50us WS2811 reset time
   if (drawBuffer != frameBuffer) {
-    memcpy(frameBuffer, drawBuffer, numbytes * numpins);
+    memcpy(frameBuffer, drawBuffer, numbytes * numpins * 8);
   }
 
   // disable timers
-  uint16_t enable = TMR4_ENBL;
-  TMR4_ENBL = enable & ~7;
+  TMR3_ENBL = 0;
 
   // force all timer outputs to logic low
-  TMR4_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_FORCE | TMR_SCTRL_MSTR;
-  TMR4_SCTRL1 = TMR_SCTRL_OEN | TMR_SCTRL_FORCE;
-  TMR4_SCTRL2 = TMR_SCTRL_OEN | TMR_SCTRL_FORCE;
+  TMR3_SCTRL3 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;
+  TMR3_SCTRL2 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;
 
   // clear any prior pending DMA requests
   XBARA1_CTRL0 |= XBARA_CTRL_STS1 | XBARA_CTRL_STS0;
@@ -266,31 +259,34 @@ void ShiftWS2811::show(void) {
 
   // fill the DMA transmit buffer
   // digitalWriteFast(12, HIGH);
-  memset(bitdata, 0, sizeof(bitdata));
+  // memset(bitdata, 0, sizeof(bitdata));
+
   uint32_t count = numbytes;
   if (count > BYTES_PER_DMA * 2) count = BYTES_PER_DMA * 2;
   framebuffer_index = count;
+
   for (uint32_t i = 0; i < numpins; i++) {
-    fillbits(bitdata + pin_offset[i], (uint8_t *)frameBuffer + i * numbytes,
-             count, 1 << pin_bitnum[i]);
+    if (pin_offset[i] > 0) continue;
+    for (uint32_t j = 0; j < 8; j++) {  // 8 pins on the SR
+      fillbits(bitdata + 8 + 7 - j, (uint8_t *)frameBuffer + i * numbytes * 8 + j * numbytes, count, 1 << pin_bitnum[i]);
+    }
   }
-  arm_dcache_flush_delete(bitdata, count * 128);
-  // digitalWriteFast(12, LOW);
+  arm_dcache_flush_delete(bitdata, sizeof(bitdata));
 
   // set up DMA transfers
   if (numbytes <= BYTES_PER_DMA * 2) {
     dma2.TCD->SADDR = bitdata;
-    dma2.TCD->DADDR = &GPIO1_DR_CLEAR;
-    dma2.TCD->CITER_ELINKNO = count * 8;
-    dma2.TCD->CSR = DMA_TCD_CSR_DREQ;
+    dma2.TCD->DADDR = &GPIO1_DR;
+    dma2.TCD->CITER_ELINKNO = count * 8 * 8 * 3;
+    dma2.TCD->CSR = DMA_TCD_CSR_DREQ | DMA_TCD_CSR_INTMAJOR;
   } else {
     dma2.TCD->SADDR = bitdata;
-    dma2.TCD->DADDR = &GPIO1_DR_CLEAR;
-    dma2.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8;
+    dma2.TCD->DADDR = &GPIO1_DR;
+    dma2.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8 * 8 * 3 - 1;
     dma2.TCD->CSR = 0;
     dma2.TCD->CSR = DMA_TCD_CSR_INTMAJOR | DMA_TCD_CSR_ESG;
-    dma2next.TCD->SADDR = bitdata + BYTES_PER_DMA * 32;
-    dma2next.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8;
+    dma2next.TCD->SADDR = bitdata + BYTES_PER_DMA * 8 * 8 * 3;
+    dma2next.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8 * 8 * 3 - 1;
     if (numbytes <= BYTES_PER_DMA * 3) {
       dma2next.TCD->CSR = DMA_TCD_CSR_ESG;
     } else {
@@ -298,57 +294,71 @@ void ShiftWS2811::show(void) {
     }
     dma_first = true;
   }
-  dma3.clearComplete();
-  dma1.enable();
+  dma2.clearComplete();
   dma2.enable();
-  dma3.enable();
 
-  // initialize timers
-  TMR4_CNTR0 = 0;
-  TMR4_CNTR1 = comp1load[0] + 1;
-  TMR4_CNTR2 = comp1load[0] + 1;
+  // // initialize timers // for TMR3_COMP10 = 13
+  // TMR3_CNTR0 = 13;
+  // TMR3_CNTR3 = 65537 - 24; // - 17 is exactly aligned, -18 to stagger signals
+  // TMR3_CNTR2 = 0; // 7 is exactly aligned, 6 to stagger signals
+
+  // initialize timers // for TMR3_COMP10 = 14
+  TMR3_CNTR0 = 14;
+  TMR3_CNTR3 = 65537 - 20;  // -17 is exactly aligned, -18 to stagger signals
+  TMR3_CNTR2 = 3;           // 8 is exactly aligned, 7 to stagger signals
 
   // wait for WS2812 reset
-  while (micros() - update_begin_micros < numbytes * 10 + 300)
+  while (sinceFinish < 80)
     ;
-
   // start everything running!
-  TMR4_ENBL = enable | 7;
+  // TMR3_ENBL |= 0b1101;  // enable TMR3, channel 0, 2
+  TMR3_ENBL |= 0b1001;  // enable TMR3, channel 0, 3
+  delayNanoseconds(30);
+  TMR3_ENBL |= 0b0100;  // enable TMR3, channel 2
   update_begin_micros = micros();
+  transferring = true;
 }
 
 void ShiftWS2811::isr(void) {
   // first ack the interrupt
   dma2.clearInterrupt();
 
+  if (framebuffer_index >= numbytes) {
+    delayNanoseconds(50);
+    TMR3_ENBL = 0;  // turn off all timers
+    sinceFinish = 0;
+    transferring = false;
+    return;
+  }
+
   // fill (up to) half the transmit buffer with new data
-  // digitalWriteFast(12, HIGH);
   uint32_t *dest;
   if (dma_first) {
     dma_first = false;
     dest = bitdata;
   } else {
     dma_first = true;
-    dest = bitdata + BYTES_PER_DMA * 32;
+    dest = bitdata + BYTES_PER_DMA * 8 * 8 * 3;
   }
-  memset(dest, 0, sizeof(bitdata) / 2);
   uint32_t index = framebuffer_index;
   uint32_t count = numbytes - framebuffer_index;
   if (count > BYTES_PER_DMA) count = BYTES_PER_DMA;
   framebuffer_index = index + count;
-  for (int i = 0; i < numpins; i++) {
-    fillbits(dest + pin_offset[i], (uint8_t *)frameBuffer + index + i * numbytes,
-             count, 1 << pin_bitnum[i]);
+
+  for (uint32_t i = 0; i < numpins; i++) {
+    if (pin_offset[i] > 0) continue;
+    for (uint32_t j = 0; j < 8; j++) {  // 8 pins on the SR
+      fillbits(dest + 8 + 7 - j, (uint8_t *)frameBuffer + index + i * numbytes * 8 + j * numbytes, count, 1 << pin_bitnum[i]);
+    }
   }
-  arm_dcache_flush_delete(dest, count * 128);
-  // digitalWriteFast(12, LOW);
+  arm_dcache_flush_delete(dest, sizeof(bitdata) / 2);
 
   // queue it for the next DMA transfer
   dma2next.TCD->SADDR = dest;
-  dma2next.TCD->CITER_ELINKNO = count * 8;
+  dma2next.TCD->CITER_ELINKNO = count * 8 * 8 * 3 - 1;
   uint32_t remain = numbytes - (index + count);
   if (remain == 0) {
-    dma2next.TCD->CSR = DMA_TCD_CSR_DREQ;
+    dma2next.TCD->CSR = DMA_TCD_CSR_DREQ | DMA_TCD_CSR_INTMAJOR;
   } else if (remain <= BYTES_PER_DMA) {
     dma2next.TCD->CSR = DMA_TCD_CSR_ESG;
   } else {
@@ -357,7 +367,7 @@ void ShiftWS2811::isr(void) {
 }
 
 int ShiftWS2811::busy(void) {
-  if (!dma3.complete())
+  if (!dma2.complete())
     ;                                                                  // DMA still running
   if (micros() - update_begin_micros < numbytes * 10 + 300) return 1;  // WS2812 reset
   return 0;

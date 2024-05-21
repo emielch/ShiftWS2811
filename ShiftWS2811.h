@@ -86,6 +86,20 @@ class ShiftWS2811 {
   void setPixel(uint32_t num, uint8_t red, uint8_t green, uint8_t blue, uint8_t white) {
     setPixel(num, Color(red, green, blue, white));
   }
+
+  void setPixelCh(uint32_t num, uint32_t channel, int color) {
+    num = channel * stripLen + num;
+    setPixel(num, color);
+  }
+  void setPixelCh(uint32_t num, uint32_t channel, uint8_t red, uint8_t green, uint8_t blue) {
+    num = channel * stripLen + num;
+    setPixel(num, color(red, green, blue));
+  }
+  void setPixelCh(uint32_t num, uint32_t channel, uint8_t red, uint8_t green, uint8_t blue, uint8_t white) {
+    num = channel * stripLen + num;
+    setPixel(num, Color(red, green, blue, white));
+  }
+
   int getPixel(uint32_t num);
 
   void show(void);

@@ -117,14 +117,13 @@ void ShiftWS2811::begin(void) {
   arm_dcache_flush_delete(bitmask, sizeof(bitmask));
 
   //----------------- TIMERS/CLOCKS ----------------------
-  // pin 14 (TMR3.2) & 15 (TMR3.3)
+  // TMR1.0 (pin 10), TMR1.1 (pin 12), TMR1.2 (pin 11), TMR3.0 (no pin)
 
-  TMR3_ENBL = 0;  // turn off all timers
-  TMR1_ENBL = 0;  // turn off all timers
+  TMR1_ENBL &= ~0b0111;  // turn off all timers
+  TMR3_ENBL &= ~0b0001;
 
   TMR3_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_FORCE;
-  TMR3_CSCTRL0 = 0;  // reset to 0, is set by pwm init code otherwise
-  // TMR3_CNTR0 = 0;
+  TMR3_CSCTRL0 = 0;
   TMR3_LOAD0 = 0;
   TMR3_COMP10 = 18;                                                                       // any faster and the laoding of the next DMA TCD (dma2next) causes memory to be skipped
   TMR3_CTRL0 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(3);  // Timer Channel Control Register p.3079
@@ -132,39 +131,28 @@ void ShiftWS2811::begin(void) {
   // | Count Length: Count until compare, then re-initialize | Output Mode: Toggle OFLAG output on successful compare
 
   // SHIFT CLOCK
-  TMR3_SCTRL3 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;  // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
-  TMR3_CSCTRL3 = 0;                                                               // Timer Channel Comparator Status and Control Register  // reset to 0, is set by pwm init code otherwise
-  // TMR3_CNTR3 = 7;
-  TMR3_LOAD3 = 65537 - 10;                                                                // low time  (65537 - x) -
-  TMR3_COMP13 = 9;                                                                        // high time (0 = always low, max = LOAD-1)
-  TMR3_CTRL3 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register // .... | Output Mode: Set on compare, cleared on counter rollover
-  *(portConfigRegister(15)) = 1;                                                          // set pin 15 to output TMR3 ch1 OFLAG
+  TMR1_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;          // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
+  TMR1_CSCTRL0 = 0;                                                                       // Timer Channel Comparator Status and Control Register  // reset to 0, is set by pwm init code otherwise
+  TMR1_LOAD0 = 65537 - 10;                                                                // low time  (65537 - x) -
+  TMR1_COMP10 = 9;                                                                        // high time (0 = always low, max = LOAD-1)
+  TMR1_CTRL0 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register // .... | Output Mode: Set on compare, cleared on counter rollover
+  *(portConfigRegister(10)) = 1;                                                          // set pin 15 to output TMR1 ch1 OFLAG
+
+  // COMMON WS2811 WAVEFORM
+  TMR1_SCTRL1 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;          // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
+  TMR1_CSCTRL1 = 0;                                                                       // reset to 0, is set by pwm init code otherwise
+  TMR1_LOAD1 = 65537 - 152;                                                               // low time  (65537 - x) -
+  TMR1_COMP11 = 152;                                                                      // high time (0 = always low, max = LOAD-1)
+  TMR1_CTRL1 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register
+  *(portConfigRegister(12)) = 1;                                                          // set pin 14 to output TMR1 ch1 OFLAG
 
   // STORE CLOCK & !OUTPUT ENABLE
-  TMR3_SCTRL2 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;  // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
-  TMR3_CSCTRL2 = 0;                                                               // reset to 0, is set by pwm init code otherwise
-  // TMR3_CNTR2 = 65537 - 32;
-  TMR3_LOAD2 = 65537 - 203;                                                               // low time  (65537 - x) -
-  TMR3_COMP12 = 101;                                                                      // high time (0 = always low, max = LOAD-1)
-  TMR3_CTRL2 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register
-  *(portConfigRegister(14)) = 1;                                                          // set pin 14 to output TMR3 ch1 OFLAG
-
-  // WS2811 WAVEFORM
-  TMR3_SCTRL1 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;  // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
-  TMR3_CSCTRL1 = 0;                                                               // reset to 0, is set by pwm init code otherwise
-  // TMR3_CNTR2 = 65537 - 32;
-  TMR3_LOAD1 = 65537 - 152;                                                               // low time  (65537 - x) -
-  TMR3_COMP11 = 152;                                                                      // high time (0 = always low, max = LOAD-1)
-  TMR3_CTRL1 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register
-  *(portConfigRegister(18)) = 1;                                                          // set pin 14 to output TMR3 ch1 OFLAG
-
-  // TEMP: OUTPUT ENABLE
-  TMR1_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;          // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
-  TMR1_CSCTRL0 = 0;                                                                       // reset to 0, is set by pwm init code otherwise
-  TMR1_LOAD0 = 65537 - 101;                                                               // low time  (65537 - x) -
-  TMR1_COMP10 = 203;                                                                      // high time (0 = always low, max = LOAD-1)
-  TMR1_CTRL0 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register
-  *(portConfigRegister(10)) = 1;                                                          // set pin 14 to output TMR3 ch1 OFLAG
+  TMR1_SCTRL2 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;          // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
+  TMR1_CSCTRL2 = 0;                                                                       // reset to 0, is set by pwm init code otherwise
+  TMR1_LOAD2 = 65537 - 203;                                                               // low time  (65537 - x) -
+  TMR1_COMP12 = 101;                                                                      // high time (0 = always low, max = LOAD-1)
+  TMR1_CTRL2 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register
+  *(portConfigRegister(11)) = 1;                                                          // set pin 14 to output TMR1 ch1 OFLAG
 
   // route the timer outputs through XBAR to edge trigger DMA request
   CCM_CCGR2 |= CCM_CCGR2_XBAR1(CCM_CCGR_ON);
@@ -178,7 +166,7 @@ void ShiftWS2811::begin(void) {
   dma2next.TCD->ATTR = DMA_TCD_ATTR_SSIZE(2) | DMA_TCD_ATTR_DSIZE(2);
   dma2next.TCD->NBYTES_MLOFFYES = DMA_TCD_NBYTES_MLOFFYES_NBYTES(4);
   dma2next.TCD->SLAST = 0;
-  dma2next.TCD->DADDR = &GPIO1_DR;
+  dma2next.TCD->DADDR = &GPIO2_DR;
   dma2next.TCD->DOFF = 0;
   dma2next.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8 * 16;
   dma2next.TCD->DLASTSGA = (int32_t)(dma2next.TCD);
@@ -248,9 +236,8 @@ static void fillbits(uint32_t *dest, const uint8_t *pixels, int n, uint32_t mask
 
 void ShiftWS2811::show(void) {
   // wait for any prior DMA operation
-  while (transferring)
-    ;  // wait
-  GPIO1_DR = 0;
+  while (transferring);  // wait
+  GPIO2_DR = 0;
   // it's ok to copy the drawing buffer to the frame buffer
   // during the 50us WS2811 reset time
   if (drawBuffer != frameBuffer) {
@@ -258,12 +245,14 @@ void ShiftWS2811::show(void) {
   }
 
   // disable timers
-  TMR3_ENBL = 0;
-  TMR1_ENBL = 0;
+  TMR1_ENBL &= ~0b0111;  // turn off all timers
+  TMR3_ENBL &= ~0b0001;
 
   // force all timer outputs to logic low
-  TMR3_SCTRL3 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;
-  TMR3_SCTRL2 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;
+  TMR3_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_FORCE;
+  TMR1_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;
+  TMR1_SCTRL1 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;
+  TMR1_SCTRL2 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;
 
   // clear any prior pending DMA requests
   XBARA1_CTRL0 |= XBARA_CTRL_STS1 | XBARA_CTRL_STS0;
@@ -271,14 +260,12 @@ void ShiftWS2811::show(void) {
 
   // fill the DMA transmit buffer
   // digitalWriteFast(12, HIGH);
-  // memset(bitdata, 0, sizeof(bitdata));
-
   uint32_t count = numbytes;
   if (count > BYTES_PER_DMA * 2) count = BYTES_PER_DMA * 2;
   framebuffer_index = count;
 
   for (uint32_t i = 0; i < numpins; i++) {
-    if (pin_offset[i] > 0) continue;
+    if (pin_offset[i] != 1) continue;
     for (uint32_t j = 0; j < 16; j++) {  // 16 pins on the SR
       fillbits(bitdata + 15 - j, (uint8_t *)frameBuffer + i * numbytes * 16 + j * numbytes, count, 1 << pin_bitnum[i]);
     }
@@ -288,12 +275,12 @@ void ShiftWS2811::show(void) {
   // set up DMA transfers
   if (numbytes <= BYTES_PER_DMA * 2) {
     dma2.TCD->SADDR = bitdata;
-    dma2.TCD->DADDR = &GPIO1_DR;
+    dma2.TCD->DADDR = &GPIO2_DR;
     dma2.TCD->CITER_ELINKNO = count * 8 * 16;
     dma2.TCD->CSR = DMA_TCD_CSR_DREQ | DMA_TCD_CSR_INTMAJOR;
   } else {
     dma2.TCD->SADDR = bitdata;
-    dma2.TCD->DADDR = &GPIO1_DR;
+    dma2.TCD->DADDR = &GPIO2_DR;
     dma2.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8 * 16;
     dma2.TCD->CSR = 0;
     dma2.TCD->CSR = DMA_TCD_CSR_INTMAJOR | DMA_TCD_CSR_ESG;
@@ -309,38 +296,20 @@ void ShiftWS2811::show(void) {
   dma2.clearComplete();
   dma2.enable();
 
-  // // initialize timers // for TMR3_COMP10 = 13
-  // TMR3_CNTR0 = 13;
-  // TMR3_CNTR3 = 65537 - 24; // - 17 is exactly aligned, -18 to stagger signals
-  // TMR3_CNTR2 = 0; // 7 is exactly aligned, 6 to stagger signals
-
-  // // initialize timers // for TMR3_COMP10 = 14
-  // TMR3_CNTR0 = 14;
-  // TMR3_CNTR3 = 65537 - 20;  // -17 is exactly aligned, -18 to stagger signals
-  // TMR3_CNTR2 = 3;           // 8 is exactly aligned, 7 to stagger signals
-
-  // // initialize timers // for TMR3_COMP10 = 15
-  // TMR3_CNTR0 = 15;          // DMA trigger
-  // TMR3_CNTR3 = 65537 - 24;  // SHIFT CLOCK, -17 is exactly aligned, -24 to stagger signals
-  // TMR3_CNTR1 = 73;          // WAVEFORM
-  // TMR3_CNTR2 = 0;           // STORE CLOCK, (with 30ns delay) 7 is exactly aligned, 0 to stagger signals
-
   // initialize timers // for TMR3_COMP10 = 18
   TMR3_CNTR0 = 18;          // DMA trigger
-  TMR3_CNTR3 = 65537 - 26;  // SHIFT CLOCK, -18 is exactly aligned, -26 to stagger signals
-  TMR3_CNTR1 = 88;          // WAVEFORM
-  TMR3_CNTR2 = 0;           // STORE CLOCK, (with 30ns delay) 9 is exactly aligned, 0 to stagger signals
-  TMR1_CNTR0 = 65537 - 91;
+  TMR1_CNTR0 = 65537 - 16;  // SHIFT CLOCK, -7 is exactly aligned, -16 to stagger signals
+  TMR1_CNTR1 = 96;          // WAVEFORM
+  TMR1_CNTR2 = 11;          // STORE CLOCK, (with 30ns delay) 20 is exactly aligned, 11 to stagger signals
 
   // wait for WS2812 reset
-  while (sinceFinish < 80)
-    ;
+  while (sinceFinish < 80);
   digitalWrite(0, HIGH);
   // start everything running!
-  TMR3_ENBL |= 0b1011;   // enable TMR3, channel 0, 1, 3
+  TMR3_ENBL |= 0b0001;   // enable DMA trigger clock
+  TMR1_ENBL |= 0b0011;   // enable SHIFT CLOCK & COMMON WAVEFORM
   delayNanoseconds(30);  // delay the start of the STORE CLOCK
-  TMR3_ENBL |= 0b0100;   // enable TMR3, channel 2
-  TMR1_ENBL |= 0b0001;   // enable TMR3, channel 2
+  TMR1_ENBL |= 0b0100;   // enable TMR3 STORE CLOCK
   update_begin_micros = micros();
   transferring = true;
   digitalWrite(0, LOW);

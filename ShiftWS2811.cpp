@@ -186,50 +186,28 @@ void ShiftWS2811::begin(void) {
   } else {
     drawBuffer = frameBuffer;
   }
+
+  memset(bitdata, 0, sizeof(bitdata));
 }
 
 static void fillbits(uint32_t *dest, const uint8_t *pixels, int n, uint32_t mask) {
   do {
     uint8_t pix = *pixels++;
-    if ((pix & 0x80))
-      *dest |= mask;
-    else
-      *dest &= ~mask;
+    if ((pix & 0x80)) *dest |= mask;
     dest += 16;  // *16 for pins on SR
-    if ((pix & 0x40))
-      *dest |= mask;
-    else
-      *dest &= ~mask;
+    if ((pix & 0x40)) *dest |= mask;
     dest += 16;
-    if ((pix & 0x20))
-      *dest |= mask;
-    else
-      *dest &= ~mask;
+    if ((pix & 0x20)) *dest |= mask;
     dest += 16;
-    if ((pix & 0x10))
-      *dest |= mask;
-    else
-      *dest &= ~mask;
+    if ((pix & 0x10)) *dest |= mask;
     dest += 16;
-    if ((pix & 0x08))
-      *dest |= mask;
-    else
-      *dest &= ~mask;
+    if ((pix & 0x08)) *dest |= mask;
     dest += 16;
-    if ((pix & 0x04))
-      *dest |= mask;
-    else
-      *dest &= ~mask;
+    if ((pix & 0x04)) *dest |= mask;
     dest += 16;
-    if ((pix & 0x02))
-      *dest |= mask;
-    else
-      *dest &= ~mask;
+    if ((pix & 0x02)) *dest |= mask;
     dest += 16;
-    if ((pix & 0x01))
-      *dest |= mask;
-    else
-      *dest &= ~mask;
+    if ((pix & 0x01)) *dest |= mask;
     dest += 16;
   } while (--n > 0);
 }
@@ -241,7 +219,7 @@ void ShiftWS2811::show(void) {
   // it's ok to copy the drawing buffer to the frame buffer
   // during the 50us WS2811 reset time
   if (drawBuffer != frameBuffer) {
-    memcpy(frameBuffer, drawBuffer, numbytes * numpins * 8);
+    memcpy(frameBuffer, drawBuffer, numbytes * numpins * 16);
   }
 
   // disable timers
@@ -260,6 +238,7 @@ void ShiftWS2811::show(void) {
 
   // fill the DMA transmit buffer
   // digitalWriteFast(12, HIGH);
+  memset(bitdata, 0, sizeof(bitdata));
   uint32_t count = numbytes;
   if (count > BYTES_PER_DMA * 2) count = BYTES_PER_DMA * 2;
   framebuffer_index = count;
@@ -340,13 +319,15 @@ void ShiftWS2811::isr(void) {
     dma_first = true;
     dest = bitdata + BYTES_PER_DMA * 8 * 16;
   }
+
+  memset(dest, 0, sizeof(bitdata) / 2);
   uint32_t index = framebuffer_index;
   uint32_t count = numbytes - framebuffer_index;
   if (count > BYTES_PER_DMA) count = BYTES_PER_DMA;
   framebuffer_index = index + count;
 
   for (uint32_t i = 0; i < numpins; i++) {
-    if (pin_offset[i] > 0) continue;
+    if (pin_offset[i] != 1) continue;
     for (uint32_t j = 0; j < 16; j++) {  // 16 pins on the SR
       fillbits(dest + 15 - j, (uint8_t *)frameBuffer + index + i * numbytes * 16 + j * numbytes, count, 1 << pin_bitnum[i]);
     }

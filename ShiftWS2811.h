@@ -139,6 +139,7 @@ class ShiftWS2811 {
   static void *drawBuffer;
   static uint8_t params;
   static DMAChannel dma1, dma2, dma3;
+  static void fillAllBits(uint32_t *dest, uint32_t index, uint32_t count);
   static void isr(void);
   static uint8_t defaultPinList[8];
 };

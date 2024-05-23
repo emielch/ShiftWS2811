@@ -186,8 +186,6 @@ void ShiftWS2811::begin(void) {
   } else {
     drawBuffer = frameBuffer;
   }
-
-  memset(bitdata, 0, sizeof(bitdata));
 }
 
 static void fillbits(uint32_t *dest, const uint8_t *pixels, int n, uint32_t mask) {
@@ -210,6 +208,16 @@ static void fillbits(uint32_t *dest, const uint8_t *pixels, int n, uint32_t mask
     if ((pix & 0x01)) *dest |= mask;
     dest += 16;
   } while (--n > 0);
+}
+
+void ShiftWS2811::fillAllBits(uint32_t *dest, uint32_t index, uint32_t count) {
+  for (uint32_t i = 0; i < numpins; i++) {
+    if (pin_offset[i] != 1) continue;
+    for (uint32_t j = 0; j < 16; j++) {  // 16 pins on the SR
+      fillbits(dest + 15 - j, (uint8_t *)frameBuffer + index + i * numbytes * 16 + j * numbytes, count, 1 << pin_bitnum[i]);
+    }
+  }
+  arm_dcache_flush_delete(dest, sizeof(bitdata) / 2);
 }
 
 void ShiftWS2811::show(void) {
@@ -243,13 +251,7 @@ void ShiftWS2811::show(void) {
   if (count > BYTES_PER_DMA * 2) count = BYTES_PER_DMA * 2;
   framebuffer_index = count;
 
-  for (uint32_t i = 0; i < numpins; i++) {
-    if (pin_offset[i] != 1) continue;
-    for (uint32_t j = 0; j < 16; j++) {  // 16 pins on the SR
-      fillbits(bitdata + 15 - j, (uint8_t *)frameBuffer + i * numbytes * 16 + j * numbytes, count, 1 << pin_bitnum[i]);
-    }
-  }
-  arm_dcache_flush_delete(bitdata, sizeof(bitdata));
+  fillAllBits(bitdata, 0, count);
 
   // set up DMA transfers
   if (numbytes <= BYTES_PER_DMA * 2) {
@@ -326,13 +328,7 @@ void ShiftWS2811::isr(void) {
   if (count > BYTES_PER_DMA) count = BYTES_PER_DMA;
   framebuffer_index = index + count;
 
-  for (uint32_t i = 0; i < numpins; i++) {
-    if (pin_offset[i] != 1) continue;
-    for (uint32_t j = 0; j < 16; j++) {  // 16 pins on the SR
-      fillbits(dest + 15 - j, (uint8_t *)frameBuffer + index + i * numbytes * 16 + j * numbytes, count, 1 << pin_bitnum[i]);
-    }
-  }
-  arm_dcache_flush_delete(dest, sizeof(bitdata) / 2);
+  fillAllBits(dest, index, count);
 
   // queue it for the next DMA transfer
   dma2next.TCD->SADDR = dest;

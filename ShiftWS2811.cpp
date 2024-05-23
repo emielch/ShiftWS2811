@@ -217,7 +217,7 @@ void ShiftWS2811::fillAllBits(uint32_t *dest, uint32_t index, uint32_t count) {
       fillbits(dest + 15 - j, (uint8_t *)frameBuffer + index + i * numbytes * 16 + j * numbytes, count, 1 << pin_bitnum[i]);
     }
   }
-  arm_dcache_flush_delete(dest, sizeof(bitdata) / 2);
+  arm_dcache_flush_delete(dest, count * 8 * 16 * 4);
 }
 
 void ShiftWS2811::show(void) {

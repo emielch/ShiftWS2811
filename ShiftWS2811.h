@@ -67,24 +67,26 @@
 #define WS2811_BGWR 29
 
 #define WS2811_800kHz 0x00  // Nearly all WS2811 are 800 kHz
-#define WS2811_400kHz 0x40  // Adafruit's Flora Pixels
-#define WS2813_800kHz 0x80  // WS2813 are close to 800 kHz but has 300 us frame set delay
 
 class ShiftWS2811 {
  public:
 #if defined(__IMXRT1062__)
   // Teensy 4.x can use any arbitrary group of pins!
-  ShiftWS2811(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config = WS2811_GRB, uint8_t numPins = 8, const uint8_t *pinList = defaultPinList);
-  void begin(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config = WS2811_GRB, uint8_t numPins = 8, const uint8_t *pinList = defaultPinList);
+  ShiftWS2811(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config = WS2811_GRB, uint8_t numPins = 8, const uint8_t *pinList = defaultPinList, bool gammaCorr = true, byte ditBits = 255);
+  void begin(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config = WS2811_GRB, uint8_t numPins = 8, const uint8_t *pinList = defaultPinList, bool gammaCorr = true, byte ditBits = 255);
   int numPixels(void);
   void begin(void);
+  byte setDitherBits(byte ditBits);
+  byte getDitherBits() { return ditherBits; }
+  void setBrightness(double bri);
+  double getBrightness() { return brightness; }
 
   void setPixel(uint32_t num, int color);
   void setPixel(uint32_t num, uint8_t red, uint8_t green, uint8_t blue) {
     setPixel(num, color(red, green, blue));
   }
   void setPixel(uint32_t num, uint8_t red, uint8_t green, uint8_t blue, uint8_t white) {
-    setPixel(num, Color(red, green, blue, white));
+    setPixel(num, color(red, green, blue, white));
   }
 
   void setPixelCh(uint32_t num, uint32_t channel, int color) {
@@ -97,7 +99,7 @@ class ShiftWS2811 {
   }
   void setPixelCh(uint32_t num, uint32_t channel, uint8_t red, uint8_t green, uint8_t blue, uint8_t white) {
     num = channel * stripLen + num;
-    setPixel(num, Color(red, green, blue, white));
+    setPixel(num, color(red, green, blue, white));
   }
 
   int getPixel(uint32_t num);
@@ -108,38 +110,22 @@ class ShiftWS2811 {
   int color(uint8_t red, uint8_t green, uint8_t blue) {
     return (red << 16) | (green << 8) | blue;
   }
-
-  // Functions for compatibility with Adafruit_NeoPixel
-  void setPixelColor(uint16_t num, uint32_t color) {
-    setPixel(num, color);
-  }
-  void setPixelColor(uint16_t num, uint8_t red, uint8_t green, uint8_t blue) {
-    setPixel(num, red, green, blue);
-  }
-  void setPixelColor(uint16_t num, uint8_t red, uint8_t green, uint8_t blue, uint8_t white) {
-    setPixel(num, red, green, blue, white);
-  }
-  // void setBrightness(uint8_t n) {
-  // brightness = n;
-  //}
-  // uint8_t getBrightness() {
-  // return brightness;
-  //}
-  uint32_t Color(uint8_t red, uint8_t green, uint8_t blue) {
-    return (red << 16) | (green << 8) | blue;
-  }
-  uint32_t Color(uint8_t red, uint8_t green, uint8_t blue, uint8_t white) {
+  int color(uint8_t red, uint8_t green, uint8_t blue, uint8_t white) {
     return (white << 24) | (red << 16) | (green << 8) | blue;
   }
 
  private:
+  static bool gammaCorrection;
+  static uint8_t ditherBits;
+  static uint8_t ditherCycle;
+  static double brightness;
   static uint16_t stripLen;
-  // static uint8_t brightness;
   static void *frameBuffer;
   static void *drawBuffer;
   static uint8_t params;
-  static DMAChannel dma1, dma2, dma3;
-  static void fillAllBits(uint32_t *dest, uint32_t index, uint32_t count);
+  static DMAChannel dma;
+  static void fillAllBits(uint32_t *dest, uint32_t index, uint32_t count, const uint8_t *ditheredLUT);
+  static void transfer();
   static void isr(void);
   static uint8_t defaultPinList[8];
 };

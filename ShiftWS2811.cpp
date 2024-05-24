@@ -25,6 +25,10 @@
 
 #include <Arduino.h>
 
+#include "GammaLUT.h"
+
+// #define DEBUG_SCOPE
+
 #if defined(__IMXRT1062__)
 
 // Ordinary RGB data is converted to GPIO bitmasks on-the-fly using
@@ -34,18 +38,21 @@
 // smaller than the half the Cortex-M7 data cache.
 #define BYTES_PER_DMA 2
 
+bool ShiftWS2811::gammaCorrection;
+uint8_t ShiftWS2811::ditherBits;
+uint8_t ShiftWS2811::ditherCycle;
+double ShiftWS2811::brightness = 100;
 uint8_t ShiftWS2811::defaultPinList[8] = {16, 17, 18, 19, 20, 21, 22, 23};
 uint16_t ShiftWS2811::stripLen;
-// uint8_t ShiftWS2811::brightness = 255;
 void *ShiftWS2811::frameBuffer;
 void *ShiftWS2811::drawBuffer;
 uint8_t ShiftWS2811::params;
-DMAChannel ShiftWS2811::dma2;
-static DMASetting dma2next;
+DMAChannel ShiftWS2811::dma;
+static DMASetting dmanext;
 static uint32_t numbytes;
 
 static uint8_t numpins;
-static uint8_t pinlist[NUM_DIGITAL_PINS];  // = {2, 14, 7, 8, 6, 20, 21, 5};
+static uint8_t pinlist[NUM_DIGITAL_PINS];
 static uint8_t pin_bitnum[NUM_DIGITAL_PINS];
 static uint8_t pin_offset[NUM_DIGITAL_PINS];
 
@@ -55,11 +62,11 @@ DMAMEM static uint32_t bitdata[BYTES_PER_DMA * 8 * 16 * 2] __attribute__((used, 
 volatile uint32_t framebuffer_index = 0;
 volatile bool dma_first;
 
-static uint32_t update_begin_micros = 0;
 static elapsedMicros sinceFinish = 0;
 static volatile bool transferring = false;
+static volatile bool show_waiting = false;
 
-ShiftWS2811::ShiftWS2811(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config, uint8_t numPins, const uint8_t *pinList) {
+ShiftWS2811::ShiftWS2811(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config, uint8_t numPins, const uint8_t *pinList, bool gammaCorr, byte ditBits) {
   stripLen = numPerStrip;
   frameBuffer = frameBuf;
   drawBuffer = drawBuf;
@@ -67,9 +74,11 @@ ShiftWS2811::ShiftWS2811(uint32_t numPerStrip, void *frameBuf, void *drawBuf, ui
   if (numPins > NUM_DIGITAL_PINS) numPins = NUM_DIGITAL_PINS;
   numpins = numPins;
   memcpy(pinlist, pinList, numpins);
+  gammaCorrection = gammaCorr;
+  setDitherBits(ditBits);
 }
 
-void ShiftWS2811::begin(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config, uint8_t numPins, const uint8_t *pinList) {
+void ShiftWS2811::begin(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config, uint8_t numPins, const uint8_t *pinList, bool gammaCorr, byte ditBits) {
   stripLen = numPerStrip;
   frameBuffer = frameBuf;
   drawBuffer = drawBuf;
@@ -77,6 +86,8 @@ void ShiftWS2811::begin(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uin
   if (numPins > NUM_DIGITAL_PINS) numPins = NUM_DIGITAL_PINS;
   numpins = numPins;
   memcpy(pinlist, pinList, numpins);
+  gammaCorrection = gammaCorr;
+  setDitherBits(ditBits);
   begin();
 }
 
@@ -90,8 +101,11 @@ static volatile uint32_t *standard_gpio_addr(volatile uint32_t *fastgpio) {
 }
 
 void ShiftWS2811::begin(void) {
+#ifdef DEBUG_SCOPE
   pinMode(0, OUTPUT);
   digitalWrite(0, LOW);
+#endif
+  setBrightness(brightness);
   transferring = false;
   if ((params & 0x1F) < 6) {
     numbytes = stripLen * 3;  // RGB formats
@@ -125,7 +139,7 @@ void ShiftWS2811::begin(void) {
   TMR3_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_FORCE;
   TMR3_CSCTRL0 = 0;
   TMR3_LOAD0 = 0;
-  TMR3_COMP10 = 18;                                                                       // any faster and the laoding of the next DMA TCD (dma2next) causes memory to be skipped
+  TMR3_COMP10 = 18;                                                                       // any faster and the laoding of the next DMA TCD (dmanext) causes memory to be skipped
   TMR3_CTRL0 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(3);  // Timer Channel Control Register p.3079
   // Count Mode: Count rising edges of primary source | Primary Count Source: IP bus clock divide by 1 prescaler
   // | Count Length: Count until compare, then re-initialize | Output Mode: Toggle OFLAG output on successful compare
@@ -161,22 +175,22 @@ void ShiftWS2811::begin(void) {
   XBARA1_CTRL0 = XBARA_CTRL_STS0 | XBARA_CTRL_EDGE0(3) | XBARA_CTRL_DEN0;
 
   // configure DMA channels
-  dma2next.TCD->SADDR = bitdata;
-  dma2next.TCD->SOFF = 4;
-  dma2next.TCD->ATTR = DMA_TCD_ATTR_SSIZE(2) | DMA_TCD_ATTR_DSIZE(2);
-  dma2next.TCD->NBYTES_MLOFFYES = DMA_TCD_NBYTES_MLOFFYES_NBYTES(4);
-  dma2next.TCD->SLAST = 0;
-  dma2next.TCD->DADDR = &GPIO2_DR;
-  dma2next.TCD->DOFF = 0;
-  dma2next.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8 * 16;
-  dma2next.TCD->DLASTSGA = (int32_t)(dma2next.TCD);
-  dma2next.TCD->BITER_ELINKNO = BYTES_PER_DMA * 8 * 16;
-  dma2next.TCD->CSR = DMA_TCD_CSR_DONE;
+  dmanext.TCD->SADDR = bitdata;
+  dmanext.TCD->SOFF = 4;
+  dmanext.TCD->ATTR = DMA_TCD_ATTR_SSIZE(2) | DMA_TCD_ATTR_DSIZE(2);
+  dmanext.TCD->NBYTES_MLOFFYES = DMA_TCD_NBYTES_MLOFFYES_NBYTES(4);
+  dmanext.TCD->SLAST = 0;
+  dmanext.TCD->DADDR = &GPIO2_DR;
+  dmanext.TCD->DOFF = 0;
+  dmanext.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8 * 16;
+  dmanext.TCD->DLASTSGA = (int32_t)(dmanext.TCD);
+  dmanext.TCD->BITER_ELINKNO = BYTES_PER_DMA * 8 * 16;
+  dmanext.TCD->CSR = DMA_TCD_CSR_DONE;
 
-  dma2.begin();
-  dma2 = dma2next;  // copies TCD
-  dma2.triggerAtHardwareEvent(DMAMUX_SOURCE_XBAR1_0);
-  dma2.attachInterrupt(isr);
+  dma.begin();
+  dma = dmanext;  // copies TCD
+  dma.triggerAtHardwareEvent(DMAMUX_SOURCE_XBAR1_0);
+  dma.attachInterrupt(isr);
 
   // set up the buffers
   uint32_t bufsize = numbytes * numpins;
@@ -188,9 +202,30 @@ void ShiftWS2811::begin(void) {
   }
 }
 
-static void fillbits(uint32_t *dest, const uint8_t *pixels, int n, uint32_t mask) {
+void ShiftWS2811::setBrightness(double bri) {
+  brightness = max(bri, 0);
+  gammaLUTCalc(brightness, gammaCorrection);
+}
+
+byte ShiftWS2811::setDitherBits(byte ditBits) {
+  ditherBits = ditBits;
+  if (ditherBits == 255) {
+    ditherBits = 0;
+    float frameTime = stripLen * 0.00003;
+    while (frameTime * 2 < (1. / 33)) {
+      frameTime *= 2;
+      ditherBits++;
+    }
+  }
+  if (ditherBits > MAX_DITHER_BITS)
+    ditherBits = MAX_DITHER_BITS;
+  ditherCycle = 0;
+  return ditherBits;
+}
+
+static void fillbits(uint32_t *dest, const uint8_t *pixels, int n, uint32_t mask, const uint8_t *ditheredLUT) {
   do {
-    uint8_t pix = *pixels++;
+    uint8_t pix = ditheredLUT[*pixels++];
     if ((pix & 0x80)) *dest |= mask;
     dest += 16;  // *16 for pins on SR
     if ((pix & 0x40)) *dest |= mask;
@@ -210,25 +245,32 @@ static void fillbits(uint32_t *dest, const uint8_t *pixels, int n, uint32_t mask
   } while (--n > 0);
 }
 
-void ShiftWS2811::fillAllBits(uint32_t *dest, uint32_t index, uint32_t count) {
+void ShiftWS2811::fillAllBits(uint32_t *dest, uint32_t index, uint32_t count, const uint8_t *ditheredLUT) {
   for (uint32_t i = 0; i < numpins; i++) {
     if (pin_offset[i] != 1) continue;
     for (uint32_t j = 0; j < 16; j++) {  // 16 pins on the SR
-      fillbits(dest + 15 - j, (uint8_t *)frameBuffer + index + i * numbytes * 16 + j * numbytes, count, 1 << pin_bitnum[i]);
+      fillbits(dest + 15 - j, (uint8_t *)frameBuffer + index + i * numbytes * 16 + j * numbytes, count, 1 << pin_bitnum[i], ditheredLUT);
     }
   }
   arm_dcache_flush_delete(dest, count * 8 * 16 * 4);
 }
 
 void ShiftWS2811::show(void) {
-  // wait for any prior DMA operation
-  while (transferring);  // wait
+  show_waiting = true;  // signal to transfer to stop after current frame
+  // wait for transfer to finish
+  while (transferring);
+  memcpy(frameBuffer, drawBuffer, numbytes * numpins * 16);
+  show_waiting = false;
+
+  transfer();
+}
+
+void ShiftWS2811::transfer(void) {
+  ditherCycle++;
+  if (ditherCycle >= (1 << ditherBits)) ditherCycle = 0;
+  const uint8_t *ditheredLUT = gammaLUT + (ditherCycle << 8);
+
   GPIO2_DR = 0;
-  // it's ok to copy the drawing buffer to the frame buffer
-  // during the 50us WS2811 reset time
-  if (drawBuffer != frameBuffer) {
-    memcpy(frameBuffer, drawBuffer, numbytes * numpins * 16);
-  }
 
   // disable timers
   TMR1_ENBL &= ~0b0111;  // turn off all timers
@@ -245,37 +287,36 @@ void ShiftWS2811::show(void) {
   XBARA1_CTRL1 |= XBARA_CTRL_STS0;
 
   // fill the DMA transmit buffer
-  // digitalWriteFast(12, HIGH);
   memset(bitdata, 0, sizeof(bitdata));
   uint32_t count = numbytes;
   if (count > BYTES_PER_DMA * 2) count = BYTES_PER_DMA * 2;
   framebuffer_index = count;
 
-  fillAllBits(bitdata, 0, count);
+  fillAllBits(bitdata, 0, count, ditheredLUT);
 
   // set up DMA transfers
   if (numbytes <= BYTES_PER_DMA * 2) {
-    dma2.TCD->SADDR = bitdata;
-    dma2.TCD->DADDR = &GPIO2_DR;
-    dma2.TCD->CITER_ELINKNO = count * 8 * 16;
-    dma2.TCD->CSR = DMA_TCD_CSR_DREQ | DMA_TCD_CSR_INTMAJOR;
+    dma.TCD->SADDR = bitdata;
+    dma.TCD->DADDR = &GPIO2_DR;
+    dma.TCD->CITER_ELINKNO = count * 8 * 16;
+    dma.TCD->CSR = DMA_TCD_CSR_DREQ | DMA_TCD_CSR_INTMAJOR;
   } else {
-    dma2.TCD->SADDR = bitdata;
-    dma2.TCD->DADDR = &GPIO2_DR;
-    dma2.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8 * 16;
-    dma2.TCD->CSR = 0;
-    dma2.TCD->CSR = DMA_TCD_CSR_INTMAJOR | DMA_TCD_CSR_ESG;
-    dma2next.TCD->SADDR = bitdata + BYTES_PER_DMA * 8 * 16;
-    dma2next.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8 * 16;
+    dma.TCD->SADDR = bitdata;
+    dma.TCD->DADDR = &GPIO2_DR;
+    dma.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8 * 16;
+    dma.TCD->CSR = 0;
+    dma.TCD->CSR = DMA_TCD_CSR_INTMAJOR | DMA_TCD_CSR_ESG;
+    dmanext.TCD->SADDR = bitdata + BYTES_PER_DMA * 8 * 16;
+    dmanext.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8 * 16;
     if (numbytes <= BYTES_PER_DMA * 3) {
-      dma2next.TCD->CSR = DMA_TCD_CSR_ESG;
+      dmanext.TCD->CSR = DMA_TCD_CSR_ESG;
     } else {
-      dma2next.TCD->CSR = DMA_TCD_CSR_ESG | DMA_TCD_CSR_INTMAJOR;
+      dmanext.TCD->CSR = DMA_TCD_CSR_ESG | DMA_TCD_CSR_INTMAJOR;
     }
     dma_first = true;
   }
-  dma2.clearComplete();
-  dma2.enable();
+  dma.clearComplete();
+  dma.enable();
 
   // initialize timers // for TMR3_COMP10 = 18
   TMR3_CNTR0 = 18;          // DMA trigger
@@ -285,30 +326,33 @@ void ShiftWS2811::show(void) {
 
   // wait for WS2812 reset
   while (sinceFinish < 80);
+#ifdef DEBUG_SCOPE
   digitalWrite(0, HIGH);
+#endif
   // start everything running!
   TMR3_ENBL |= 0b0001;   // enable DMA trigger clock
   TMR1_ENBL |= 0b0011;   // enable SHIFT CLOCK & COMMON WAVEFORM
   delayNanoseconds(30);  // delay the start of the STORE CLOCK
   TMR1_ENBL |= 0b0100;   // enable TMR3 STORE CLOCK
-  update_begin_micros = micros();
   transferring = true;
+#ifdef DEBUG_SCOPE
   digitalWrite(0, LOW);
+#endif
 }
 
 void ShiftWS2811::isr(void) {
   // first ack the interrupt
-  dma2.clearInterrupt();
+  dma.clearInterrupt();
 
   if (framebuffer_index >= numbytes) {
     delayNanoseconds(500);
     TMR3_ENBL = 0;  // turn off all timers
     TMR1_ENBL = 0;  // turn off all timers
     sinceFinish = 0;
-    transferring = false;
-    // digitalWrite(0, HIGH);
-    // delayNanoseconds(200);
-    // digitalWrite(0, LOW);
+    if (gammaCorrection && ditherBits > 0 && !show_waiting)  // if we apply gamma correction, dithering is on and there is no new frame waiting to be shown
+      transfer();                                            // continue dithering the current frame
+    else
+      transferring = false;
     return;
   }
 
@@ -327,27 +371,25 @@ void ShiftWS2811::isr(void) {
   uint32_t count = numbytes - framebuffer_index;
   if (count > BYTES_PER_DMA) count = BYTES_PER_DMA;
   framebuffer_index = index + count;
+  const uint8_t *ditheredLUT = gammaLUT + (ditherCycle << 8);
 
-  fillAllBits(dest, index, count);
+  fillAllBits(dest, index, count, ditheredLUT);
 
   // queue it for the next DMA transfer
-  dma2next.TCD->SADDR = dest;
-  dma2next.TCD->CITER_ELINKNO = count * 8 * 16;
+  dmanext.TCD->SADDR = dest;
+  dmanext.TCD->CITER_ELINKNO = count * 8 * 16;
   uint32_t remain = numbytes - (index + count);
   if (remain == 0) {
-    dma2next.TCD->CSR = DMA_TCD_CSR_DREQ | DMA_TCD_CSR_INTMAJOR;
+    dmanext.TCD->CSR = DMA_TCD_CSR_DREQ | DMA_TCD_CSR_INTMAJOR;
   } else if (remain <= BYTES_PER_DMA) {
-    dma2next.TCD->CSR = DMA_TCD_CSR_ESG;
+    dmanext.TCD->CSR = DMA_TCD_CSR_ESG;
   } else {
-    dma2next.TCD->CSR = DMA_TCD_CSR_ESG | DMA_TCD_CSR_INTMAJOR;
+    dmanext.TCD->CSR = DMA_TCD_CSR_ESG | DMA_TCD_CSR_INTMAJOR;
   }
 }
 
 int ShiftWS2811::busy(void) {
-  if (!dma2.complete())
-    ;                                                                  // DMA still running
-  if (micros() - update_begin_micros < numbytes * 10 + 300) return 1;  // WS2812 reset
-  return 0;
+  return transferring;
 }
 
 // For Teensy 4.x, the pixel data is stored in ordinary RGB format.  Translation

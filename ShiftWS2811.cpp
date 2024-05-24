@@ -279,7 +279,7 @@ void ShiftWS2811::show(void) {
 
   // initialize timers // for TMR3_COMP10 = 18
   TMR3_CNTR0 = 18;          // DMA trigger
-  TMR1_CNTR0 = 65537 - 16;  // SHIFT CLOCK, -7 is exactly aligned, -16 to stagger signals
+  TMR1_CNTR0 = 65537 - 18;  // SHIFT CLOCK, -7 is exactly aligned, -18 to stagger signals (-16 is sometimes still too early when there is a hickup when loading next DMA TCD, causing glitches on last SR pin)
   TMR1_CNTR1 = 96;          // WAVEFORM
   TMR1_CNTR2 = 11;          // STORE CLOCK, (with 30ns delay) 20 is exactly aligned, 11 to stagger signals
 

@@ -66,6 +66,12 @@ static elapsedMicros sinceFinish = 0;
 static volatile bool transferring = false;
 static volatile bool show_waiting = false;
 
+const int DMA_TICS = 23;
+const int PERIOD = DMA_TICS * 16;
+const int OEHIGH = 122;
+const int T0H_TICS = 61;
+const int WF_HIGH = T0H_TICS + OEHIGH / 2;
+
 ShiftWS2811::ShiftWS2811(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config, uint8_t numPins, const uint8_t *pinList, bool gammaCorr, byte ditBits) {
   stripLen = numPerStrip;
   frameBuffer = frameBuf;
@@ -139,7 +145,7 @@ void ShiftWS2811::begin(void) {
   TMR3_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_FORCE;
   TMR3_CSCTRL0 = 0;
   TMR3_LOAD0 = 0;
-  TMR3_COMP10 = 18;                                                                       // any faster and the laoding of the next DMA TCD (dmanext) causes memory to be skipped
+  TMR3_COMP10 = DMA_TICS - 1;
   TMR3_CTRL0 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(3);  // Timer Channel Control Register p.3079
   // Count Mode: Count rising edges of primary source | Primary Count Source: IP bus clock divide by 1 prescaler
   // | Count Length: Count until compare, then re-initialize | Output Mode: Toggle OFLAG output on successful compare
@@ -147,24 +153,24 @@ void ShiftWS2811::begin(void) {
   // SHIFT CLOCK
   TMR1_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;          // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
   TMR1_CSCTRL0 = 0;                                                                       // Timer Channel Comparator Status and Control Register  // reset to 0, is set by pwm init code otherwise
-  TMR1_LOAD0 = 65537 - 10;                                                                // low time  (65537 - x) -
-  TMR1_COMP10 = 9;                                                                        // high time (0 = always low, max = LOAD-1)
+  TMR1_LOAD0 = 65537 - floor(DMA_TICS / 2.);                                              // low time  (65537 - x) -
+  TMR1_COMP10 = ceil(DMA_TICS / 2.);                                                      // high time (0 = always low, max = LOAD-1)
   TMR1_CTRL0 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register // .... | Output Mode: Set on compare, cleared on counter rollover
   *(portConfigRegister(10)) = 1;                                                          // set pin 15 to output TMR1 ch1 OFLAG
 
   // COMMON WS2811 WAVEFORM
   TMR1_SCTRL1 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;          // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
   TMR1_CSCTRL1 = 0;                                                                       // reset to 0, is set by pwm init code otherwise
-  TMR1_LOAD1 = 65537 - 152;                                                               // low time  (65537 - x) -
-  TMR1_COMP11 = 152;                                                                      // high time (0 = always low, max = LOAD-1)
+  TMR1_LOAD1 = 65537 - (PERIOD - WF_HIGH);                                                // low time  (65537 - x) -
+  TMR1_COMP11 = WF_HIGH;                                                                  // high time (0 = always low, max = LOAD-1)
   TMR1_CTRL1 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register
   *(portConfigRegister(12)) = 1;                                                          // set pin 14 to output TMR1 ch1 OFLAG
 
   // STORE CLOCK & !OUTPUT ENABLE
   TMR1_SCTRL2 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;          // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
   TMR1_CSCTRL2 = 0;                                                                       // reset to 0, is set by pwm init code otherwise
-  TMR1_LOAD2 = 65537 - 203;                                                               // low time  (65537 - x) -
-  TMR1_COMP12 = 101;                                                                      // high time (0 = always low, max = LOAD-1)
+  TMR1_LOAD2 = 65537 - (PERIOD - OEHIGH);                                                 // low time  (65537 - x) -
+  TMR1_COMP12 = OEHIGH;                                                                   // high time (0 = always low, max = LOAD-1)
   TMR1_CTRL2 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register
   *(portConfigRegister(11)) = 1;                                                          // set pin 14 to output TMR1 ch1 OFLAG
 
@@ -319,10 +325,10 @@ void ShiftWS2811::transfer(void) {
   dma.enable();
 
   // initialize timers // for TMR3_COMP10 = 18
-  TMR3_CNTR0 = 18;          // DMA trigger
-  TMR1_CNTR0 = 65537 - 18;  // SHIFT CLOCK, -7 is exactly aligned, -18 to stagger signals (-16 is sometimes still too early when there is a hickup when loading next DMA TCD, causing glitches on last SR pin)
-  TMR1_CNTR1 = 96;          // WAVEFORM
-  TMR1_CNTR2 = 11;          // STORE CLOCK, (with 30ns delay) 20 is exactly aligned, 11 to stagger signals
+  TMR3_CNTR0 = DMA_TICS - 1;            // DMA trigger
+  TMR1_CNTR0 = 65537 - (DMA_TICS + 4);  // SHIFT CLOCK
+  TMR1_CNTR1 = 46;                      // WAVEFORM
+  TMR1_CNTR2 = 0;                       // STORE CLOCK, (delay set below)
 
   // wait for WS2812 reset
   while (sinceFinish < 80);
@@ -330,10 +336,11 @@ void ShiftWS2811::transfer(void) {
   digitalWrite(0, HIGH);
 #endif
   // start everything running!
-  TMR3_ENBL |= 0b0001;   // enable DMA trigger clock
-  TMR1_ENBL |= 0b0011;   // enable SHIFT CLOCK & COMMON WAVEFORM
-  delayNanoseconds(30);  // delay the start of the STORE CLOCK
-  TMR1_ENBL |= 0b0100;   // enable TMR3 STORE CLOCK
+  TMR3_ENBL |= 0b0001;  // enable DMA trigger clock
+  TMR1_ENBL |= 0b0011;  // enable SHIFT CLOCK & COMMON WAVEFORM
+  uint32_t begin = ARM_DWT_CYCCNT;
+  while (ARM_DWT_CYCCNT - begin < DMA_TICS - 10);  // delay the start of the STORE CLOCK
+  TMR1_ENBL |= 0b0100;                             // enable TMR3 STORE CLOCK
   transferring = true;
 #ifdef DEBUG_SCOPE
   digitalWrite(0, LOW);
@@ -345,9 +352,10 @@ void ShiftWS2811::isr(void) {
   dma.clearInterrupt();
 
   if (framebuffer_index >= numbytes) {
-    delayNanoseconds(500);
-    TMR3_ENBL = 0;  // turn off all timers
-    TMR1_ENBL = 0;  // turn off all timers
+    uint32_t begin = ARM_DWT_CYCCNT;
+    while (ARM_DWT_CYCCNT - begin < PERIOD * 1.5);
+    TMR1_ENBL &= ~0b0111;  // turn off all timers
+    TMR3_ENBL &= ~0b0001;
     sinceFinish = 0;
     if (gammaCorrection && ditherBits > 0 && !show_waiting)  // if we apply gamma correction, dithering is on and there is no new frame waiting to be shown
       transfer();                                            // continue dithering the current frame

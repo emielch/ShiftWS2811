@@ -71,6 +71,7 @@ const int PERIOD = DMA_TICS * 16;
 const int OEHIGH = 122;
 const int T0H_TICS = 61;
 const int WF_HIGH = T0H_TICS + OEHIGH / 2;
+const double LED_TIME = 24 / (double(F_BUS_ACTUAL) / DMA_TICS / 16);
 
 ShiftWS2811::ShiftWS2811(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config, uint8_t numPins, const uint8_t *pinList, bool gammaCorr, byte ditBits) {
   stripLen = numPerStrip;
@@ -217,7 +218,7 @@ byte ShiftWS2811::setDitherBits(byte ditBits) {
   ditherBits = ditBits;
   if (ditherBits == 255) {
     ditherBits = 0;
-    float frameTime = stripLen * 0.00003;
+    float frameTime = stripLen * LED_TIME;
     while (frameTime * 2 < (1. / 33)) {
       frameTime *= 2;
       ditherBits++;

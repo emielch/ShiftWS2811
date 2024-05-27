@@ -200,7 +200,7 @@ void ShiftWS2811::begin(void) {
   dma.attachInterrupt(isr);
 
   // set up the buffers
-  uint32_t bufsize = numbytes * numpins;
+  uint32_t bufsize = numbytes * numpins * 16;
   memset(frameBuffer, 0, bufsize);
   if (drawBuffer) {
     memset(drawBuffer, 0, bufsize);
@@ -252,10 +252,12 @@ static void fillbits(uint32_t *dest, const uint8_t *pixels, int n, uint32_t mask
   } while (--n > 0);
 }
 
-void ShiftWS2811::fillAllBits(uint32_t *dest, uint32_t index, uint32_t count, const uint8_t *ditheredLUT) {
+void ShiftWS2811::fillAllBits(uint32_t *dest, uint32_t index, uint32_t count) {
   for (uint32_t i = 0; i < numpins; i++) {
     if (pin_offset[i] != 1) continue;
-    for (uint32_t j = 0; j < 16; j++) {  // 16 pins on the SR
+    for (uint32_t j = 0; j < 16; j++) {                     // 16 pins on the SR
+      ditherCycle = (ditherCycle + 1) % (1 << ditherBits);  // apply an offset to the dithering according to the pin number
+      const uint8_t *ditheredLUT = gammaLUT + (ditherCycle << 8);
       fillbits(dest + 15 - j, (uint8_t *)frameBuffer + index + i * numbytes * 16 + j * numbytes, count, 1 << pin_bitnum[i], ditheredLUT);
     }
   }
@@ -266,16 +268,15 @@ void ShiftWS2811::show(void) {
   show_waiting = true;  // signal to transfer to stop after current frame
   // wait for transfer to finish
   while (transferring);
-  memcpy(frameBuffer, drawBuffer, numbytes * numpins * 16);
+  if (drawBuffer != frameBuffer)
+    memcpy(frameBuffer, drawBuffer, numbytes * numpins * 16);
   show_waiting = false;
 
   transfer();
 }
 
 void ShiftWS2811::transfer(void) {
-  ditherCycle++;
-  if (ditherCycle >= (1 << ditherBits)) ditherCycle = 0;
-  const uint8_t *ditheredLUT = gammaLUT + (ditherCycle << 8);
+  ditherCycle = (ditherCycle + 1) % (1 << ditherBits);
 
   GPIO2_DR = 0;
 
@@ -299,7 +300,7 @@ void ShiftWS2811::transfer(void) {
   if (count > BYTES_PER_DMA * 2) count = BYTES_PER_DMA * 2;
   framebuffer_index = count;
 
-  fillAllBits(bitdata, 0, count, ditheredLUT);
+  fillAllBits(bitdata, 0, count);
 
   // set up DMA transfers
   if (numbytes <= BYTES_PER_DMA * 2) {
@@ -380,9 +381,8 @@ void ShiftWS2811::isr(void) {
   uint32_t count = numbytes - framebuffer_index;
   if (count > BYTES_PER_DMA) count = BYTES_PER_DMA;
   framebuffer_index = index + count;
-  const uint8_t *ditheredLUT = gammaLUT + (ditherCycle << 8);
 
-  fillAllBits(dest, index, count, ditheredLUT);
+  fillAllBits(dest, index, count);
 
   // queue it for the next DMA transfer
   dmanext.TCD->SADDR = dest;

@@ -72,8 +72,8 @@ class ShiftWS2811 {
  public:
 #if defined(__IMXRT1062__)
   // Teensy 4.x can use any arbitrary group of pins!
-  ShiftWS2811(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config = WS2811_GRB, uint8_t numPins = 8, const uint8_t *pinList = defaultPinList, bool gammaCorr = true, byte ditBits = 255);
-  void begin(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config = WS2811_GRB, uint8_t numPins = 8, const uint8_t *pinList = defaultPinList, bool gammaCorr = true, byte ditBits = 255);
+  ShiftWS2811(uint32_t numPerStrip, void *frontBuf, void *backBuf, void *drawBuf, uint8_t config = WS2811_GRB, uint8_t numPins = 8, const uint8_t *pinList = defaultPinList, bool gammaCorr = true, byte ditBits = 255);
+  void begin(uint32_t numPerStrip, void *frontBuf, void *backBuf, void *drawBuf, uint8_t config = WS2811_GRB, uint8_t numPins = 8, const uint8_t *pinList = defaultPinList, bool gammaCorr = true, byte ditBits = 255);
   int numPixels(void);
   void begin(void);
   byte setDitherBits(byte ditBits);
@@ -120,7 +120,8 @@ class ShiftWS2811 {
   static uint8_t ditherCycle;
   static double brightness;
   static uint16_t stripLen;
-  static void *frameBuffer;
+  static void *frontBuffer;
+  static void *backBuffer;
   static void *drawBuffer;
   static uint8_t params;
   static DMAChannel dma;

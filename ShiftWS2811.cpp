@@ -44,7 +44,8 @@ uint8_t ShiftWS2811::ditherCycle;
 double ShiftWS2811::brightness = 100;
 uint8_t ShiftWS2811::defaultPinList[8] = {16, 17, 18, 19, 20, 21, 22, 23};
 uint16_t ShiftWS2811::stripLen;
-void *ShiftWS2811::frameBuffer;
+void *ShiftWS2811::frontBuffer;
+void *ShiftWS2811::backBuffer;
 void *ShiftWS2811::drawBuffer;
 uint8_t ShiftWS2811::params;
 DMAChannel ShiftWS2811::dma;
@@ -59,12 +60,12 @@ static uint8_t pin_offset[NUM_DIGITAL_PINS];
 DMAMEM static uint32_t bitmask[4] __attribute__((used, aligned(32)));
 // *8 for 8 bits in a byte, *16 for 16 bits in a SR, *2 for circular buffer (filling buffer while DMA sends the other half)
 DMAMEM static uint32_t bitdata[BYTES_PER_DMA * 8 * 16 * 2] __attribute__((used, aligned(32)));
-volatile uint32_t framebuffer_index = 0;
+volatile uint32_t frontbuffer_index = 0;
 volatile bool dma_first;
 
 static elapsedMicros sinceFinish = 0;
 static volatile bool transferring = false;
-static volatile bool show_waiting = false;
+static volatile bool new_frame = false;
 
 const int DMA_TICS = 23;
 const int PERIOD = DMA_TICS * 16;
@@ -73,9 +74,10 @@ const int T0H_TICS = 61;
 const int WF_HIGH = T0H_TICS + OEHIGH / 2;
 const double LED_TIME = 24 / (double(F_BUS_ACTUAL) / DMA_TICS / 16);
 
-ShiftWS2811::ShiftWS2811(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config, uint8_t numPins, const uint8_t *pinList, bool gammaCorr, byte ditBits) {
+ShiftWS2811::ShiftWS2811(uint32_t numPerStrip, void *frontBuf, void *backBuf, void *drawBuf, uint8_t config, uint8_t numPins, const uint8_t *pinList, bool gammaCorr, byte ditBits) {
   stripLen = numPerStrip;
-  frameBuffer = frameBuf;
+  frontBuffer = frontBuf;
+  backBuffer = backBuf;
   drawBuffer = drawBuf;
   params = config;
   if (numPins > NUM_DIGITAL_PINS) numPins = NUM_DIGITAL_PINS;
@@ -85,9 +87,10 @@ ShiftWS2811::ShiftWS2811(uint32_t numPerStrip, void *frameBuf, void *drawBuf, ui
   setDitherBits(ditBits);
 }
 
-void ShiftWS2811::begin(uint32_t numPerStrip, void *frameBuf, void *drawBuf, uint8_t config, uint8_t numPins, const uint8_t *pinList, bool gammaCorr, byte ditBits) {
+void ShiftWS2811::begin(uint32_t numPerStrip, void *frontBuf, void *backBuf, void *drawBuf, uint8_t config, uint8_t numPins, const uint8_t *pinList, bool gammaCorr, byte ditBits) {
   stripLen = numPerStrip;
-  frameBuffer = frameBuf;
+  frontBuffer = frontBuf;
+  backBuffer = backBuf;
   drawBuffer = drawBuf;
   params = config;
   if (numPins > NUM_DIGITAL_PINS) numPins = NUM_DIGITAL_PINS;
@@ -201,11 +204,11 @@ void ShiftWS2811::begin(void) {
 
   // set up the buffers
   uint32_t bufsize = numbytes * numpins * 16;
-  memset(frameBuffer, 0, bufsize);
+  memset(frontBuffer, 0, bufsize);
   if (drawBuffer) {
     memset(drawBuffer, 0, bufsize);
   } else {
-    drawBuffer = frameBuffer;
+    drawBuffer = frontBuffer;
   }
 }
 
@@ -258,24 +261,29 @@ void ShiftWS2811::fillAllBits(uint32_t *dest, uint32_t index, uint32_t count) {
     for (uint32_t j = 0; j < 16; j++) {                     // 16 pins on the SR
       ditherCycle = (ditherCycle + 1) % (1 << ditherBits);  // apply an offset to the dithering according to the pin number
       const uint8_t *ditheredLUT = gammaLUT + (ditherCycle << 8);
-      fillbits(dest + 15 - j, (uint8_t *)frameBuffer + index + i * numbytes * 16 + j * numbytes, count, 1 << pin_bitnum[i], ditheredLUT);
+      fillbits(dest + 15 - j, (uint8_t *)frontBuffer + index + i * numbytes * 16 + j * numbytes, count, 1 << pin_bitnum[i], ditheredLUT);
     }
   }
   arm_dcache_flush_delete(dest, count * 8 * 16 * 4);
 }
 
 void ShiftWS2811::show(void) {
-  show_waiting = true;  // signal to transfer to stop after current frame
-  // wait for transfer to finish
-  while (transferring);
-  if (drawBuffer != frameBuffer)
-    memcpy(frameBuffer, drawBuffer, numbytes * numpins * 16);
-  show_waiting = false;
+  while (new_frame);  // wait till the last new frame has been attented to
+  if (drawBuffer != backBuffer)
+    memcpy(backBuffer, drawBuffer, numbytes * numpins * 16);
+  new_frame = true;
 
-  transfer();
+  if (!transferring)
+    transfer();
 }
 
 void ShiftWS2811::transfer(void) {
+  if (new_frame) {  // point frontBuffer to the newly copied frame waiting in backBuffer
+    void *temp = backBuffer;
+    backBuffer = frontBuffer;
+    frontBuffer = temp;
+    new_frame = false;
+  }
   ditherCycle = (ditherCycle + 1) % (1 << ditherBits);
 
   GPIO2_DR = 0;
@@ -298,7 +306,7 @@ void ShiftWS2811::transfer(void) {
   memset(bitdata, 0, sizeof(bitdata));
   uint32_t count = numbytes;
   if (count > BYTES_PER_DMA * 2) count = BYTES_PER_DMA * 2;
-  framebuffer_index = count;
+  frontbuffer_index = count;
 
   fillAllBits(bitdata, 0, count);
 
@@ -353,14 +361,14 @@ void ShiftWS2811::isr(void) {
   // first ack the interrupt
   dma.clearInterrupt();
 
-  if (framebuffer_index >= numbytes) {
+  if (frontbuffer_index >= numbytes) {
     uint32_t begin = ARM_DWT_CYCCNT;
     while (ARM_DWT_CYCCNT - begin < PERIOD * 1.5);
     TMR1_ENBL &= ~0b0111;  // turn off all timers
     TMR3_ENBL &= ~0b0001;
     sinceFinish = 0;
-    if (gammaCorrection && ditherBits > 0 && !show_waiting)  // if we apply gamma correction, dithering is on and there is no new frame waiting to be shown
-      transfer();                                            // continue dithering the current frame
+    if ((gammaCorrection && ditherBits > 0) || new_frame)  // if we apply gamma correction, dithering is on or there is a new frame waiting to be shown
+      transfer();                                          // continue dithering the current frame
     else
       transferring = false;
     return;
@@ -377,10 +385,10 @@ void ShiftWS2811::isr(void) {
   }
 
   memset(dest, 0, sizeof(bitdata) / 2);
-  uint32_t index = framebuffer_index;
-  uint32_t count = numbytes - framebuffer_index;
+  uint32_t index = frontbuffer_index;
+  uint32_t count = numbytes - frontbuffer_index;
   if (count > BYTES_PER_DMA) count = BYTES_PER_DMA;
-  framebuffer_index = index + count;
+  frontbuffer_index = index + count;
 
   fillAllBits(dest, index, count);
 

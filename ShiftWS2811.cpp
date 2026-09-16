@@ -25,7 +25,7 @@
 
 #include <Arduino.h>
 
-#include "GammaLUT.h"
+#include "gammaLUT.h"
 
 // #define DEBUG_SCOPE
 

@@ -2,18 +2,24 @@
   "name": "ShiftWS2811",
   "frameworks": "Arduino",
   "platforms": "Teensy",
-  "keywords": "serial",
-  "description": "Control thousands of WS2811/2812 LEDs at video refresh speeds",
-  "homepage": "http://www.pjrc.com/teensy/td_libs_OctoWS2811.html",
-  "authors":
-  {
-    "name": "Paul Stoffregen",
-    "maintainer": true
+  "keywords": "WS2811, WS2812, FlexIO, shift register, LED",
+  "description": "Drive 128 WS2811 LED chains in parallel through 74HC595 shift registers with FlexIO2 and DMA on Teensy 4.1",
+  "homepage": "https://github.com/emielch/ShiftWS2811",
+  "authors": [
+    {
+      "name": "Emiel Harmsen",
+      "maintainer": true
+    },
+    {
+      "name": "Paul Stoffregen"
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/emielch/ShiftWS2811"
   },
-  "repository":
-  {
-      "type": "git",
-      "url": "https://github.com/PaulStoffregen/OctoWS2811"
+  "build": {
+    "srcFilter": ["+<*>", "-<test/>"]
   },
-  "version": "1.5"
+  "version": "2.0.0"
 }

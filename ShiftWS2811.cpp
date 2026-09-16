@@ -1,6 +1,8 @@
-/*  ShiftWS2811 - High Performance WS2811 LED Display Library
-    http://www.pjrc.com/teensy/td_libs_ShiftWS2811.html
-    Copyright (c) 2020 Paul Stoffregen, PJRC.COM, LLC
+/*  ShiftWS2811 - 128 channel WS2811 LED driver through 74HC595 shift registers
+    FlexIO2 + eDMA implementation for Teensy 4.1
+
+    Copyright (c) 2020 Paul Stoffregen, PJRC.COM, LLC (OctoWS2811 origins)
+    Copyright (c) 2026 Emiel Harmsen
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to deal
@@ -25,75 +27,413 @@
 
 #include <Arduino.h>
 
+#include "ShiftWS2811_fill.h"
 #include "gammaLUT.h"
-
-// #define DEBUG_SCOPE
 
 #if defined(__IMXRT1062__)
 
-// Ordinary RGB data is converted to GPIO bitmasks on-the-fly using
-// a transmit buffer sized for 2 DMA transfers.  The larger this setting,
-// the more interrupt latency ShiftWS2811 can tolerate, but the transmit
-// buffer grows in size.  For good performance, the buffer should be kept
-// smaller than the half the Cortex-M7 data cache.
-#define BYTES_PER_DMA 2
+/* ===========================================================================
+   How this works
+   ===========================================================================
+   Board (see the ShiftWS2811_PCB KiCad project):
+     - 8 chains of 2x74AHCT595 (16 outputs each).  DATA of chain i comes
+       straight from a Teensy pin, SRCLK of all chains from pin 10 and RCLK
+       (store) of all chains from pin 11.
+     - Pin 11 also, RC delayed, enables the 595 outputs (through the inverting
+       74AHCT240) and tri-states the COMMON_WF drivers (74AHCT245 U3):
+           STORE high -> the 595 outputs drive the LED data lines (data phase)
+           STORE low  -> the lines follow COMMON_WF through 1k resistors
+     - Pin 12 carries COMMON_WF: high during the leading T0H phase of every
+       WS2811 bit and low during the trailing low phase.
+
+   One WS2811 bit period (SHIFTWS2811_BIT_NS), everything in FlexIO clocks:
+
+     COMMON  ____/~~~~~~~~~~~~~~~~~~~~~~~~\_____________________________/~~~~
+     STORE   _____________/~~~~~~~~~~~~~~~~~~~~~~~~~~~~\_____________________
+     LED     ____/~~~~~~~~~<      595 data (0 or 1)   >_____________________
+                 <- T0H -> <-         DATA_NS        -> <-      low     ->
+
+   The STORE rising edge latches the 16 bits that were shifted into the 595s
+   during the previous bit period; the shift clock therefore runs continuously
+   with exactly 16 shifts per bit period and the STORE edge is placed midway
+   between two shift clock edges.
+
+   FlexIO2 does all of the timing, the CPU only converts colour data:
+
+     shifter 0..7  transmit mode, 32-bit parallel shift, chained (INSRC).
+                   Shifter 0 drives FlexIO2 pins D[lo..lo+width], a range that
+                   covers all data pins (pads in the range that are not muxed
+                   to FlexIO are unaffected).  Every shift clock outputs one
+                   32-bit word, so the 8 shifters hold 8 shifts and the DMA
+                   refills all 8 SHIFTBUF registers (32 bytes) twice per bit
+                   period.  Shifter 0's status flag is the DMA request.
+     timer 0       shift clock, dual 8-bit baud mode, pin 10.  Starts when the
+                   DMA has filled SHIFTBUF7 and runs until the frame is done.
+     timer 1, 2    one-shot delays started together with timer 0.  Their
+                   falling edges start the COMMON and STORE PWM timers, which
+                   fixes the phase of all waveforms to the cycle.
+     timer 6, 7    COMMON and STORE, dual 8-bit PWM mode, pins 12 and 11.
+     timer 5       counts STORE edges (decrements on the STORE pin) and, after
+                   the last bit of the frame, disables itself, which disables
+                   timers 6 and 7 with it ("disable on timer N-1 disable").
+     timer 4       reset gap: started by timer 5's end, interrupts after
+                   SHIFTWS2811_RESET_US so the next frame can begin.
+
+   The eDMA streams 32-byte groups from a double buffered conversion buffer
+   into SHIFTBUF0..7 (destination address modulo 32).  After the last data
+   group a self-linking TCD keeps writing zeros until the frame end interrupt
+   stops the shift clock, so the shifters never underrun at the frame end.  A
+   real underrun during a frame sets SHIFTERR, which is counted per frame and
+   available through underruns().
+   =========================================================================== */
+
+/* ------------------------------------------------------------------ tuning */
+
+#ifndef SHIFTWS2811_BIT_NS
+#define SHIFTWS2811_BIT_NS 1250 /* WS2811 bit period (800 kHz) */
+#endif
+#ifndef SHIFTWS2811_T0H_NS
+#define SHIFTWS2811_T0H_NS 300 /* high time of a 0 bit (COMMON high before STORE) */
+#endif
+#ifndef SHIFTWS2811_DATA_NS
+#define SHIFTWS2811_DATA_NS 400 /* 595 outputs enabled; a 1 bit is high for T0H + DATA */
+#endif
+#ifndef SHIFTWS2811_RESET_US
+#define SHIFTWS2811_RESET_US 80 /* low time between frames */
+#endif
+#ifndef SHIFTWS2811_BYTES_PER_DMA
+#define SHIFTWS2811_BYTES_PER_DMA 6 /* LED bytes converted per DMA interrupt (two buffers) */
+#endif
+#ifndef SHIFTWS2811_SHIFT_DIV
+#define SHIFTWS2811_SHIFT_DIV 3 /* shift clock period = 2 * (DIV + 1) FlexIO clocks */
+#endif
+#ifndef SHIFTWS2811_TRIGGER_LATENCY
+#define SHIFTWS2811_TRIGGER_LATENCY 1 /* FlexIO clocks from a timer output edge to the start of the timer it enables */
+#endif
+#ifndef SHIFTWS2811_DMA_BURST
+#define SHIFTWS2811_DMA_BURST 1 /* 1: 32-byte burst source reads, 0: 32-bit source reads */
+#endif
+#ifndef SHIFTWS2811_DMA_PRIORITY
+#define SHIFTWS2811_DMA_PRIORITY 1 /* 1: give the DMA channel the highest fixed priority of its group */
+#endif
+#ifndef SHIFTWS2811_PIN_SHIFT_CLK
+#define SHIFTWS2811_PIN_SHIFT_CLK 10 /* 74HC595 SRCLK   (FlexIO2 D0) */
+#endif
+#ifndef SHIFTWS2811_PIN_STORE
+#define SHIFTWS2811_PIN_STORE 11 /* 74HC595 RCLK / output enable (FlexIO2 D2) */
+#endif
+#ifndef SHIFTWS2811_PIN_COMMON
+#define SHIFTWS2811_PIN_COMMON 12 /* COMMON_WF (FlexIO2 D1) */
+#endif
+
+/* ---------------------------------------------------------- derived values */
+
+static const uint32_t CYC_PER_SHIFT = 2 * (SHIFTWS2811_SHIFT_DIV + 1);
+static const uint32_t CYC_PER_BIT = SHIFTWS_SR_LEN * CYC_PER_SHIFT;
+static const uint32_t FLEXIO_HZ = (uint32_t)((uint64_t)CYC_PER_BIT * 1000000000ull / SHIFTWS2811_BIT_NS);
+
+static constexpr uint32_t ns2cyc(uint32_t ns) {
+  return (uint32_t)(((uint64_t)ns * CYC_PER_BIT + SHIFTWS2811_BIT_NS / 2) / SHIFTWS2811_BIT_NS);
+}
+
+static const uint32_t T0H_CYC = ns2cyc(SHIFTWS2811_T0H_NS);
+static const uint32_t DATA_CYC = ns2cyc(SHIFTWS2811_DATA_NS);
+static const uint32_t STORE_HIGH_CYC = DATA_CYC;
+static const uint32_t STORE_LOW_CYC = CYC_PER_BIT - STORE_HIGH_CYC;
+/* COMMON stays high into the data phase; while STORE is high the COMMON drivers
+   are tri-stated anyway, so this only guarantees there is never a gap. */
+static const uint32_t COMMON_HIGH_CYC = T0H_CYC + DATA_CYC / 2;
+static const uint32_t COMMON_LOW_CYC = CYC_PER_BIT - COMMON_HIGH_CYC;
+/* One-shot delays measured from the shift clock start.  The first STORE edge
+   comes one bit period after the shift clock starts, i.e. exactly between the
+   16th and 17th shift clock rising edge. */
+static const uint32_t DELAY_STORE_CYC = CYC_PER_BIT - SHIFTWS2811_TRIGGER_LATENCY;
+static const uint32_t DELAY_COMMON_CYC = CYC_PER_BIT - T0H_CYC - SHIFTWS2811_TRIGGER_LATENCY;
+static const uint32_t GAP_CYC = (uint32_t)((uint64_t)SHIFTWS2811_RESET_US * FLEXIO_HZ / 1000000);
+static const double LED_TIME = 24.0 * SHIFTWS2811_BIT_NS * 1e-9; /* seconds per RGB LED */
+
+static_assert(SHIFTWS2811_SHIFT_DIV >= 0 && SHIFTWS2811_SHIFT_DIV <= 255, "SHIFTWS2811_SHIFT_DIV must fit 8 bits");
+static_assert(FLEXIO_HZ <= 120000000u, "FlexIO clock above 120 MHz: raise SHIFTWS2811_BIT_NS or lower SHIFTWS2811_SHIFT_DIV");
+static_assert(T0H_CYC >= 1 && T0H_CYC + DATA_CYC < CYC_PER_BIT, "T0H + DATA must be shorter than the bit period");
+static_assert(STORE_HIGH_CYC >= 1 && STORE_HIGH_CYC <= 256 && STORE_LOW_CYC >= 1 && STORE_LOW_CYC <= 256,
+              "STORE PWM phases must be 1..256 FlexIO clocks");
+static_assert(COMMON_HIGH_CYC >= 1 && COMMON_HIGH_CYC <= 256 && COMMON_LOW_CYC >= 1 && COMMON_LOW_CYC <= 256,
+              "COMMON PWM phases must be 1..256 FlexIO clocks");
+static_assert(DELAY_COMMON_CYC >= 1 && DELAY_STORE_CYC >= 1, "trigger latency too large");
+static_assert(GAP_CYC >= 1 && GAP_CYC <= 65535, "reset gap does not fit a 16-bit timer");
+static_assert(SHIFTWS2811_BYTES_PER_DMA >= 1, "need at least one LED byte per DMA buffer");
+
+/* FlexIO2 timer allocation.  Timer 0 is the only one that can not use "enable
+   on timer N-1 enable"; timers 6 and 7 use "disable on timer N-1 disable". */
+enum {
+  TMR_SHIFT = 0,        /* shift clock */
+  TMR_DELAY_COMMON = 1, /* one-shot, starts with TMR_SHIFT */
+  TMR_DELAY_STORE = 2,  /* one-shot, starts with TMR_DELAY_COMMON */
+  TMR_GAP = 4,          /* reset gap after the frame */
+  TMR_END = 5,          /* counts STORE edges, ends the frame */
+  TMR_COMMON = 6,       /* COMMON PWM, disabled with TMR_END */
+  TMR_STORE = 7,        /* STORE PWM, disabled with TMR_COMMON */
+};
+static constexpr uint32_t TRG_TIMER(uint32_t n) { return 4 * n + 3; }   /* TRGSEL: timer N output */
+static constexpr uint32_t TRG_SHIFTER(uint32_t n) { return 4 * n + 1; } /* TRGSEL: shifter N status flag */
+static const int NUM_SHIFTERS = 8;
+
+/* --------------------------------------------------------------- variables */
 
 bool ShiftWS2811::gammaCorrection;
 uint8_t ShiftWS2811::ditherBits;
 uint8_t ShiftWS2811::ditherCycle;
 double ShiftWS2811::brightness = 100;
-uint8_t ShiftWS2811::defaultPinList[8] = {16, 17, 18, 19, 20, 21, 22, 23};
+uint8_t ShiftWS2811::defaultPinList[8] = {6, 7, 8, 9, 34, 35, 36, 37};
 uint16_t ShiftWS2811::stripLen;
 void *ShiftWS2811::frontBuffer;
 void *ShiftWS2811::backBuffer;
 void *ShiftWS2811::drawBuffer;
 uint8_t ShiftWS2811::params;
 DMAChannel ShiftWS2811::dma;
-static DMASetting dmanext;
-static uint32_t numbytes;
 
+static uint32_t numbytes; /* colour bytes per shift register output (3 or 4 per LED) */
 static uint8_t numpins;
-static uint8_t pinlist[NUM_DIGITAL_PINS];
-static uint8_t pin_bitnum[NUM_DIGITAL_PINS];
-static uint8_t pin_offset[NUM_DIGITAL_PINS];
+static uint8_t pinlist[SHIFTWS_MAX_CHAINS];
+static uint8_t flexPinLo;        /* first FlexIO2 pin of the parallel data range */
+static uint8_t flexPWidth;       /* SHIFTCFG[PWIDTH] */
+static uint8_t flexShiftClkPin;  /* FlexIO2 pin indices of the timer outputs */
+static uint8_t flexStorePin;
+static uint8_t flexCommonPin;
+static uint32_t shiftClkTimctl;  /* TIMCTL value that starts the shift clock */
+static ShiftWSFillPlan plan;
+static uint8_t zeroLUT[256];
 
-DMAMEM static uint32_t bitmask[4] __attribute__((used, aligned(32)));
-// *8 for 8 bits in a byte, *16 for 16 bits in a SR, *2 for circular buffer (filling buffer while DMA sends the other half)
-DMAMEM static uint32_t bitdata[BYTES_PER_DMA * 8 * 16 * 2] __attribute__((used, aligned(32)));
-volatile uint32_t frontbuffer_index = 0;
-volatile bool dma_first;
+static const uint32_t WORDS_PER_GROUP = 8; /* one DMA minor loop = SHIFTBUF0..7 */
+static const uint32_t HALF_WORDS = SHIFTWS2811_BYTES_PER_DMA * SHIFTWS_BITS_PER_BYTE * SHIFTWS_SR_LEN; /* worst case: 16 words per bit */
+DMAMEM static uint32_t bitdata[2][HALF_WORDS] __attribute__((used, aligned(32)));
+DMAMEM static uint32_t zeroWords[WORDS_PER_GROUP] __attribute__((used, aligned(32)));
+static DMASetting dmanext; /* loaded by scatter/gather when the running buffer completes */
+static DMASetting dmazero; /* endless stream of zero words after the last data buffer */
 
-static elapsedMicros sinceFinish = 0;
+static volatile uint32_t fillCol;  /* next LED byte column to convert */
+static volatile uint8_t fillHalf;  /* bitdata half to convert into next */
 static volatile bool transferring = false;
 static volatile bool new_frame = false;
+static volatile uint32_t underrunCount = 0;
+static volatile uint32_t frameCount = 0;
+static volatile uint32_t stallCount = 0;
+static uint8_t initError = 0;
 
-const int DMA_TICS = 23;
-const int PERIOD = DMA_TICS * 16;
-const int OEHIGH = 122;
-const int T0H_TICS = 61;
-const int WF_HIGH = T0H_TICS + OEHIGH / 2;
-const double LED_TIME = 24 / (double(F_BUS_ACTUAL) / DMA_TICS / 16);
+/* -------------------------------------------------------------- utilities */
 
-ShiftWS2811::ShiftWS2811(uint32_t numPerStrip, void *frontBuf, void *backBuf, void *drawBuf, uint8_t config, uint8_t numPins, const uint8_t *pinList, bool gammaCorr, byte ditBits) {
+static inline uint32_t umin(uint32_t a, uint32_t b) { return a < b ? a : b; }
+
+/* FlexIO2 pin index of a Teensy pin, 0xFF if the pin is not on FlexIO2.  The
+   FlexIO2 pins are exactly the GPIO2 pads (GPIO_B0_xx -> D[xx], GPIO_B1_xx ->
+   D[16+xx]) with the same bit numbers, so the fast-GPIO bit is the index. */
+static uint8_t flexio2Pin(uint8_t pin) {
+  if (pin >= CORE_NUM_DIGITAL) return 0xFF;
+  if (portOutputRegister(pin) != &GPIO7_DR) return 0xFF;
+  return digitalPinToBit(pin);
+}
+
+static uint32_t gcd32(uint32_t a, uint32_t b) {
+  while (b) {
+    uint32_t t = a % b;
+    a = b;
+    b = t;
+  }
+  return a;
+}
+
+/* Program the otherwise unused video PLL (PLL5) and the FlexIO2 clock root so
+   that FlexIO2 runs at exactly hz.  FlexIO3 shares this clock root.  Same
+   register sequence the Teensy Audio library uses for the audio PLL. */
+FLASHMEM static bool setupFlexIO2Clock(uint32_t hz) {
+  static const uint8_t postDiv[3] = {1, 2, 4}, postCode[3] = {2, 1, 0}; /* PLL_VIDEO[POST_DIV_SELECT] */
+  static const uint8_t vidDiv[3] = {1, 2, 4}, vidCode[3] = {0, 1, 3};   /* MISC2[VIDEO_DIV] */
+  uint32_t bestTotal = 0;
+  int bestP = 0, bestV = 0;
+  uint32_t bestPred = 1, bestPodf = 1;
+  for (int p = 0; p < 3; p++) {
+    for (int v = 0; v < 3; v++) {
+      for (uint32_t pred = 1; pred <= 8; pred++) {
+        for (uint32_t podf = 1; podf <= 8; podf++) {
+          uint32_t total = postDiv[p] * vidDiv[v] * pred * podf;
+          uint64_t vco = (uint64_t)hz * total;
+          if (vco < 650000000ull || vco > 1300000000ull) continue;
+          if (bestTotal == 0 || total < bestTotal) {
+            bestTotal = total;
+            bestP = p;
+            bestV = v;
+            bestPred = pred;
+            bestPodf = podf;
+          }
+        }
+      }
+    }
+  }
+  if (bestTotal == 0) return false;
+  const uint32_t vco = hz * bestTotal;
+  const uint32_t mult = vco / 24000000; /* 27..54 given the VCO range */
+  const uint32_t rem = vco % 24000000;
+  const uint32_t g = rem ? gcd32(rem, 24000000) : 1;
+  const uint32_t num = rem ? rem / g : 0;
+  const uint32_t den = rem ? 24000000 / g : 1;
+
+  CCM_ANALOG_PLL_VIDEO = CCM_ANALOG_PLL_VIDEO_BYPASS | CCM_ANALOG_PLL_VIDEO_ENABLE |
+                         CCM_ANALOG_PLL_VIDEO_POST_DIV_SELECT(postCode[bestP]) | CCM_ANALOG_PLL_VIDEO_DIV_SELECT(mult);
+  CCM_ANALOG_PLL_VIDEO_NUM = num;
+  CCM_ANALOG_PLL_VIDEO_DENOM = den;
+  CCM_ANALOG_PLL_VIDEO_CLR = CCM_ANALOG_PLL_VIDEO_POWERDOWN;
+  uint32_t start = micros();
+  while (!(CCM_ANALOG_PLL_VIDEO & CCM_ANALOG_PLL_VIDEO_LOCK)) {
+    if (micros() - start > 20000) return false;
+  }
+  CCM_ANALOG_MISC2 = (CCM_ANALOG_MISC2 & ~CCM_ANALOG_MISC2_VIDEO_DIV(3)) | CCM_ANALOG_MISC2_VIDEO_DIV(vidCode[bestV]);
+  CCM_ANALOG_PLL_VIDEO_CLR = CCM_ANALOG_PLL_VIDEO_BYPASS;
+
+  CCM_CCGR3 &= ~CCM_CCGR3_FLEXIO2(3);
+  CCM_CSCMR2 = (CCM_CSCMR2 & ~CCM_CSCMR2_FLEXIO2_CLK_SEL(3)) | CCM_CSCMR2_FLEXIO2_CLK_SEL(2); /* PLL5 */
+  CCM_CS1CDR = (CCM_CS1CDR & ~(CCM_CS1CDR_FLEXIO2_CLK_PRED(7) | CCM_CS1CDR_FLEXIO2_CLK_PODF(7))) |
+               CCM_CS1CDR_FLEXIO2_CLK_PRED(bestPred - 1) | CCM_CS1CDR_FLEXIO2_CLK_PODF(bestPodf - 1);
+  CCM_CCGR3 |= CCM_CCGR3_FLEXIO2(CCM_CCGR_ON);
+  return true;
+}
+
+/* Put the shifters in transmit mode.  Re-entering transmit mode sets all
+   status flags, which is what makes the DMA prefill SHIFTBUF0..7 before the
+   shift clock starts, so this is done at the start of every frame. */
+static void configureShifters(void) {
+  IMXRT_FLEXIO_t &f = IMXRT_FLEXIO2_S;
+  for (int i = 0; i < NUM_SHIFTERS; i++) f.SHIFTCTL[i] = 0;
+  for (int i = 0; i < NUM_SHIFTERS; i++) {
+    f.SHIFTCFG[i] = FLEXIO_SHIFTCFG_PWIDTH(flexPWidth) | (i < NUM_SHIFTERS - 1 ? FLEXIO_SHIFTCFG_INSRC : 0) |
+                    FLEXIO_SHIFTCFG_SSTOP(0) | FLEXIO_SHIFTCFG_SSTART(0);
+    f.SHIFTCTL[i] = FLEXIO_SHIFTCTL_TIMSEL(TMR_SHIFT) | FLEXIO_SHIFTCTL_TIMPOL /* shift on the falling edge */ |
+                    FLEXIO_SHIFTCTL_PINCFG(i == 0 ? 3 : 0) | FLEXIO_SHIFTCTL_PINSEL(flexPinLo) | FLEXIO_SHIFTCTL_SMOD(2);
+  }
+}
+
+FLASHMEM static void configureTimers(uint32_t numBits) {
+  IMXRT_FLEXIO_t &f = IMXRT_FLEXIO2_S;
+  for (int i = 0; i < 8; i++) f.TIMCTL[i] = 0;
+
+  /* one-shot delays: 16-bit counter, output high while running, disabled at compare */
+  f.TIMCMP[TMR_DELAY_COMMON] = DELAY_COMMON_CYC - 1;
+  f.TIMCFG[TMR_DELAY_COMMON] = FLEXIO_TIMCFG_TIMOUT(0) | FLEXIO_TIMCFG_TIMDEC(0) | FLEXIO_TIMCFG_TIMRST(0) |
+                               FLEXIO_TIMCFG_TIMDIS(2) | FLEXIO_TIMCFG_TIMENA(1) /* with timer 0 */;
+  f.TIMCTL[TMR_DELAY_COMMON] = FLEXIO_TIMCTL_TRGSRC | FLEXIO_TIMCTL_PINCFG(0) | FLEXIO_TIMCTL_TIMOD(3);
+
+  f.TIMCMP[TMR_DELAY_STORE] = DELAY_STORE_CYC - 1;
+  f.TIMCFG[TMR_DELAY_STORE] = FLEXIO_TIMCFG_TIMOUT(0) | FLEXIO_TIMCFG_TIMDEC(0) | FLEXIO_TIMCFG_TIMRST(0) |
+                              FLEXIO_TIMCFG_TIMDIS(2) | FLEXIO_TIMCFG_TIMENA(1) /* with timer 1 */;
+  f.TIMCTL[TMR_DELAY_STORE] = FLEXIO_TIMCTL_TRGSRC | FLEXIO_TIMCTL_PINCFG(0) | FLEXIO_TIMCTL_TIMOD(3);
+
+  /* frame end: count both edges of the STORE pin, two per bit */
+  f.TIMCMP[TMR_END] = 2 * numBits - 1;
+  f.TIMCFG[TMR_END] = FLEXIO_TIMCFG_TIMOUT(0) | FLEXIO_TIMCFG_TIMDEC(2) /* pin edges */ | FLEXIO_TIMCFG_TIMRST(0) |
+                      FLEXIO_TIMCFG_TIMDIS(2) | FLEXIO_TIMCFG_TIMENA(6) /* rising edge of timer 1 */;
+  f.TIMCTL[TMR_END] = FLEXIO_TIMCTL_TRGSEL(TRG_TIMER(TMR_DELAY_COMMON)) | FLEXIO_TIMCTL_TRGSRC |
+                      FLEXIO_TIMCTL_PINCFG(0) | FLEXIO_TIMCTL_PINSEL(flexStorePin) | FLEXIO_TIMCTL_TIMOD(3);
+
+  /* reset gap: started by the falling edge of the frame end timer */
+  f.TIMCMP[TMR_GAP] = GAP_CYC - 1;
+  f.TIMCFG[TMR_GAP] = FLEXIO_TIMCFG_TIMOUT(0) | FLEXIO_TIMCFG_TIMDEC(0) | FLEXIO_TIMCFG_TIMRST(0) |
+                      FLEXIO_TIMCFG_TIMDIS(2) | FLEXIO_TIMCFG_TIMENA(6);
+  f.TIMCTL[TMR_GAP] = FLEXIO_TIMCTL_TRGSEL(TRG_TIMER(TMR_END)) | FLEXIO_TIMCTL_TRGPOL | FLEXIO_TIMCTL_TRGSRC |
+                      FLEXIO_TIMCTL_PINCFG(0) | FLEXIO_TIMCTL_TIMOD(3);
+
+  /* COMMON waveform: PWM started by the falling edge of one-shot 1 */
+  f.TIMCMP[TMR_COMMON] = ((COMMON_LOW_CYC - 1) << 8) | (COMMON_HIGH_CYC - 1);
+  f.TIMCFG[TMR_COMMON] = FLEXIO_TIMCFG_TIMOUT(0) | FLEXIO_TIMCFG_TIMDEC(0) | FLEXIO_TIMCFG_TIMRST(0) |
+                         FLEXIO_TIMCFG_TIMDIS(1) /* with timer 5 */ | FLEXIO_TIMCFG_TIMENA(6);
+  f.TIMCTL[TMR_COMMON] = FLEXIO_TIMCTL_TRGSEL(TRG_TIMER(TMR_DELAY_COMMON)) | FLEXIO_TIMCTL_TRGPOL | FLEXIO_TIMCTL_TRGSRC |
+                         FLEXIO_TIMCTL_PINCFG(3) | FLEXIO_TIMCTL_PINSEL(flexCommonPin) | FLEXIO_TIMCTL_TIMOD(2);
+
+  /* STORE waveform: PWM started by the falling edge of one-shot 2 */
+  f.TIMCMP[TMR_STORE] = ((STORE_LOW_CYC - 1) << 8) | (STORE_HIGH_CYC - 1);
+  f.TIMCFG[TMR_STORE] = FLEXIO_TIMCFG_TIMOUT(0) | FLEXIO_TIMCFG_TIMDEC(0) | FLEXIO_TIMCFG_TIMRST(0) |
+                        FLEXIO_TIMCFG_TIMDIS(1) /* with timer 6 */ | FLEXIO_TIMCFG_TIMENA(6);
+  f.TIMCTL[TMR_STORE] = FLEXIO_TIMCTL_TRGSEL(TRG_TIMER(TMR_DELAY_STORE)) | FLEXIO_TIMCTL_TRGPOL | FLEXIO_TIMCTL_TRGSRC |
+                        FLEXIO_TIMCTL_PINCFG(3) | FLEXIO_TIMCTL_PINSEL(flexStorePin) | FLEXIO_TIMCTL_TIMOD(2);
+
+  /* shift clock: dual 8-bit baud mode, reload every 8 words; starts when
+     SHIFTBUF7 has been written (all buffers full) and runs until stopped */
+  const uint32_t shiftsPerReload = WORDS_PER_GROUP * plan.layout.shiftsPerWord;
+  f.TIMCMP[TMR_SHIFT] = ((shiftsPerReload * 2 - 1) << 8) | SHIFTWS2811_SHIFT_DIV;
+  f.TIMCFG[TMR_SHIFT] = FLEXIO_TIMCFG_TIMOUT(1) /* low when enabled */ | FLEXIO_TIMCFG_TIMDEC(0) | FLEXIO_TIMCFG_TIMRST(0) |
+                        FLEXIO_TIMCFG_TIMDIS(0) | FLEXIO_TIMCFG_TIMENA(2) /* trigger high */;
+  shiftClkTimctl = FLEXIO_TIMCTL_TRGSEL(TRG_SHIFTER(NUM_SHIFTERS - 1)) | FLEXIO_TIMCTL_TRGPOL /* flag low = full */ |
+                   FLEXIO_TIMCTL_TRGSRC | FLEXIO_TIMCTL_PINCFG(3) | FLEXIO_TIMCTL_PINSEL(flexShiftClkPin) |
+                   FLEXIO_TIMCTL_TIMOD(1);
+
+  f.TIMIEN = (1 << TMR_END) | (1 << TMR_GAP);
+}
+
+/* TCD for one conversion buffer: `words` words to SHIFTBUF0..7 in 32-byte
+   groups, then scatter/gather to `next`. */
+static void setDataTcd(DMABaseClass::TCD_t *t, const uint32_t *src, uint32_t words, const void *next) {
+  t->SADDR = src;
+#if SHIFTWS2811_DMA_BURST
+  t->SOFF = 32;
+  t->ATTR = DMA_TCD_ATTR_SSIZE(5) /* 32-byte burst */ | DMA_TCD_ATTR_DMOD(5) | DMA_TCD_ATTR_DSIZE(2);
+#else
+  t->SOFF = 4;
+  t->ATTR = DMA_TCD_ATTR_SSIZE(2) | DMA_TCD_ATTR_DMOD(5) | DMA_TCD_ATTR_DSIZE(2);
+#endif
+  t->NBYTES_MLOFFNO = 4 * WORDS_PER_GROUP;
+  t->SLAST = 0;
+  t->DADDR = (volatile void *)&IMXRT_FLEXIO2_S.SHIFTBUF[0];
+  t->DOFF = 4;
+  t->CITER_ELINKNO = words / WORDS_PER_GROUP;
+  t->BITER_ELINKNO = words / WORDS_PER_GROUP;
+  t->DLASTSGA = (int32_t)(uint32_t)next;
+  t->CSR = DMA_TCD_CSR_ESG | DMA_TCD_CSR_INTMAJOR;
+}
+
+FLASHMEM static void setZeroTcd(DMABaseClass::TCD_t *t) {
+  setDataTcd(t, zeroWords, WORDS_PER_GROUP * 0x7FFF, t);
+  t->SOFF = 0; /* read the same 8 zero words forever */
+  t->CSR = DMA_TCD_CSR_ESG;
+}
+
+#if SHIFTWS2811_DMA_PRIORITY
+/* Swap fixed priorities with the top channel of our group so that pending
+   requests of other channels do not delay the SHIFTBUF refill. */
+FLASHMEM static void raiseDmaPriority(uint8_t ch) {
+  volatile uint8_t *dchpri = &DMA_DCHPRI3; /* byte swapped within each word */
+  const uint8_t top = (ch & 0x10) | 0x0F;
+  if (top == ch) return;
+  const uint32_t mine = (ch & 0x1C) | (3 - (ch & 0x03));
+  const uint32_t theirs = (top & 0x1C) | (3 - (top & 0x03));
+  const uint8_t myPri = dchpri[mine] & 0x0F;
+  const uint8_t theirPri = dchpri[theirs] & 0x0F;
+  dchpri[theirs] = (dchpri[theirs] & (DMA_DCHPRI_ECP | DMA_DCHPRI_DPA)) | myPri;
+  dchpri[mine] = theirPri; /* not preemptable, may preempt */
+}
+#endif
+
+/* ---------------------------------------------------------------- public */
+
+FLASHMEM ShiftWS2811::ShiftWS2811(uint32_t numPerStrip, void *frontBuf, void *backBuf, void *drawBuf, uint8_t config, uint8_t numPins,
+                         const uint8_t *pinList, bool gammaCorr, byte ditBits) {
   stripLen = numPerStrip;
   frontBuffer = frontBuf;
   backBuffer = backBuf;
   drawBuffer = drawBuf;
   params = config;
-  if (numPins > NUM_DIGITAL_PINS) numPins = NUM_DIGITAL_PINS;
+  if (numPins > SHIFTWS_MAX_CHAINS) numPins = SHIFTWS_MAX_CHAINS;
   numpins = numPins;
   memcpy(pinlist, pinList, numpins);
   gammaCorrection = gammaCorr;
   setDitherBits(ditBits);
 }
 
-void ShiftWS2811::begin(uint32_t numPerStrip, void *frontBuf, void *backBuf, void *drawBuf, uint8_t config, uint8_t numPins, const uint8_t *pinList, bool gammaCorr, byte ditBits) {
+FLASHMEM void ShiftWS2811::begin(uint32_t numPerStrip, void *frontBuf, void *backBuf, void *drawBuf, uint8_t config, uint8_t numPins,
+                        const uint8_t *pinList, bool gammaCorr, byte ditBits) {
   stripLen = numPerStrip;
   frontBuffer = frontBuf;
   backBuffer = backBuf;
   drawBuffer = drawBuf;
   params = config;
-  if (numPins > NUM_DIGITAL_PINS) numPins = NUM_DIGITAL_PINS;
+  if (numPins > SHIFTWS_MAX_CHAINS) numPins = SHIFTWS_MAX_CHAINS;
   numpins = numPins;
   memcpy(pinlist, pinList, numpins);
   gammaCorrection = gammaCorr;
@@ -101,109 +441,119 @@ void ShiftWS2811::begin(uint32_t numPerStrip, void *frontBuf, void *backBuf, voi
   begin();
 }
 
-int ShiftWS2811::numPixels(void) {
-  return stripLen * numpins;
-}
+int ShiftWS2811::numPixels(void) { return stripLen * numpins * SHIFTWS_SR_LEN; }
 
-extern "C" void xbar_connect(unsigned int input, unsigned int output);  // in pwm.c
-static volatile uint32_t *standard_gpio_addr(volatile uint32_t *fastgpio) {
-  return (volatile uint32_t *)((uint32_t)fastgpio - 0x01E48000);
-}
-
-void ShiftWS2811::begin(void) {
-#ifdef DEBUG_SCOPE
-  pinMode(0, OUTPUT);
-  digitalWrite(0, LOW);
-#endif
-  setBrightness(brightness);
+FLASHMEM void ShiftWS2811::begin(void) {
+  initError = 0;
   transferring = false;
-  if ((params & 0x1F) < 6) {
-    numbytes = stripLen * 3;  // RGB formats
-  } else {
-    numbytes = stripLen * 4;  // RGBW formats
+  new_frame = false;
+  setBrightness(brightness);
+  numbytes = ((params & 0x1F) < 6) ? stripLen * 3 : stripLen * 4;
+  const uint32_t numBits = numbytes * SHIFTWS_BITS_PER_BYTE;
+
+  if (numpins == 0 || numpins > SHIFTWS_MAX_CHAINS) {
+    initError = ERR_NUM_PINS;
+    return;
+  }
+  if (numBits == 0 || 2 * numBits - 1 > 0xFFFF) {
+    initError = ERR_STRIP_LENGTH;
+    return;
   }
 
-  // configure which pins to use
-  memset(bitmask, 0, sizeof(bitmask));
+  /* map the pins onto FlexIO2 */
+  flexShiftClkPin = flexio2Pin(SHIFTWS2811_PIN_SHIFT_CLK);
+  flexStorePin = flexio2Pin(SHIFTWS2811_PIN_STORE);
+  flexCommonPin = flexio2Pin(SHIFTWS2811_PIN_COMMON);
+  uint8_t fx[SHIFTWS_MAX_CHAINS];
+  uint8_t lo = 31, hi = 0;
   for (uint32_t i = 0; i < numpins; i++) {
-    uint8_t pin = pinlist[i];
-    if (pin >= NUM_DIGITAL_PINS) continue;  // ignore illegal pins
-    uint8_t bit = digitalPinToBit(pin);
-    uint8_t offset = ((uint32_t)portOutputRegister(pin) - (uint32_t)&GPIO6_DR) >> 14;
-    if (offset > 3) continue;  // ignore unknown pins
-    pin_bitnum[i] = bit;
-    pin_offset[i] = offset;
-    uint32_t mask = 1 << bit;
-    bitmask[offset] |= mask;
-    *(&IOMUXC_GPR_GPR26 + offset) &= ~mask;
-    *standard_gpio_addr(portModeRegister(pin)) |= mask;
+    fx[i] = flexio2Pin(pinlist[i]);
+    if (fx[i] == 0xFF) {
+      initError = ERR_PIN_NOT_FLEXIO;
+      return;
+    }
+    if (fx[i] < lo) lo = fx[i];
+    if (fx[i] > hi) hi = fx[i];
   }
-  arm_dcache_flush_delete(bitmask, sizeof(bitmask));
+  if (flexShiftClkPin == 0xFF || flexStorePin == 0xFF || flexCommonPin == 0xFF) {
+    initError = ERR_PIN_NOT_FLEXIO;
+    return;
+  }
+  flexPinLo = lo;
+  flexPWidth = (hi > lo) ? (hi - lo) : 1; /* a single pin still needs a 4-bit shift */
+  const uint8_t rangeHi = lo + flexPWidth;
+  const uint8_t timerPins[3] = {flexShiftClkPin, flexStorePin, flexCommonPin};
+  for (int t = 0; t < 3; t++) {
+    if (timerPins[t] >= lo && timerPins[t] <= rangeHi) {
+      initError = ERR_PIN_RANGE;
+      return;
+    }
+    for (uint32_t i = 0; i < numpins; i++) {
+      if (fx[i] == timerPins[t]) {
+        initError = ERR_PIN_RANGE;
+        return;
+      }
+    }
+  }
+  const uint8_t shiftWidth = flexPWidth <= 3 ? 4 : flexPWidth <= 7 ? 8 : flexPWidth <= 15 ? 16 : 32;
+  uint8_t lanes[SHIFTWS_MAX_CHAINS];
+  for (uint32_t i = 0; i < numpins; i++) lanes[i] = fx[i] - lo;
+  plan.layout = shiftws_makeLayout(shiftWidth);
+  plan.numGroups = (numpins + SHIFTWS_CHAINS_PER_GROUP - 1) / SHIFTWS_CHAINS_PER_GROUP;
+  shiftws_buildSpread(&plan);
+  shiftws_buildExpand(&plan, lanes, numpins);
+  memset(zeroLUT, 0, sizeof(zeroLUT));
 
-  //----------------- TIMERS/CLOCKS ----------------------
-  // TMR1.0 (pin 10), TMR1.1 (pin 12), TMR1.2 (pin 11), TMR3.0 (no pin)
+  /* conversion buffers and the zero group live in OCRAM for the DMA */
+  memset(bitdata, 0, sizeof(bitdata));
+  arm_dcache_flush_delete(bitdata, sizeof(bitdata));
+  memset(zeroWords, 0, sizeof(zeroWords));
+  arm_dcache_flush_delete(zeroWords, sizeof(zeroWords));
 
-  TMR1_ENBL &= ~0b0111;  // turn off all timers
-  TMR3_ENBL &= ~0b0001;
+  /* FlexIO2 clock and module */
+  if (!setupFlexIO2Clock(FLEXIO_HZ)) {
+    initError = ERR_PLL;
+    return;
+  }
+  IMXRT_FLEXIO_t &f = IMXRT_FLEXIO2_S;
+  f.CTRL = FLEXIO_CTRL_SWRST;
+  f.CTRL = 0;
+  asm volatile("dsb");
+  if ((f.PARAM & 0xFF) < (uint32_t)NUM_SHIFTERS || ((f.PARAM >> 8) & 0xFF) < 8) {
+    initError = ERR_FLEXIO;
+    return;
+  }
+  f.CTRL = FLEXIO_CTRL_FLEXEN;
+  configureShifters();
+  configureTimers(numBits);
+  f.SHIFTSDEN = 1; /* shifter 0 status flag -> DMA request */
 
-  TMR3_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_FORCE;
-  TMR3_CSCTRL0 = 0;
-  TMR3_LOAD0 = 0;
-  TMR3_COMP10 = DMA_TICS - 1;
-  TMR3_CTRL0 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(3);  // Timer Channel Control Register p.3079
-  // Count Mode: Count rising edges of primary source | Primary Count Source: IP bus clock divide by 1 prescaler
-  // | Count Length: Count until compare, then re-initialize | Output Mode: Toggle OFLAG output on successful compare
+  /* pins: everything on FlexIO2 is mux mode ALT4 */
+  for (uint32_t i = 0; i < numpins; i++) *(portConfigRegister(pinlist[i])) = 4;
+  *(portConfigRegister(SHIFTWS2811_PIN_SHIFT_CLK)) = 4;
+  *(portConfigRegister(SHIFTWS2811_PIN_STORE)) = 4;
+  *(portConfigRegister(SHIFTWS2811_PIN_COMMON)) = 4;
 
-  // SHIFT CLOCK
-  TMR1_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;          // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
-  TMR1_CSCTRL0 = 0;                                                                       // Timer Channel Comparator Status and Control Register  // reset to 0, is set by pwm init code otherwise
-  TMR1_LOAD0 = 65537 - floor(DMA_TICS / 2.);                                              // low time  (65537 - x) -
-  TMR1_COMP10 = ceil(DMA_TICS / 2.);                                                      // high time (0 = always low, max = LOAD-1)
-  TMR1_CTRL0 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register // .... | Output Mode: Set on compare, cleared on counter rollover
-  *(portConfigRegister(10)) = 1;                                                          // set pin 15 to output TMR1 ch1 OFLAG
-
-  // COMMON WS2811 WAVEFORM
-  TMR1_SCTRL1 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;          // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
-  TMR1_CSCTRL1 = 0;                                                                       // reset to 0, is set by pwm init code otherwise
-  TMR1_LOAD1 = 65537 - (PERIOD - WF_HIGH);                                                // low time  (65537 - x) -
-  TMR1_COMP11 = WF_HIGH;                                                                  // high time (0 = always low, max = LOAD-1)
-  TMR1_CTRL1 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register
-  *(portConfigRegister(12)) = 1;                                                          // set pin 14 to output TMR1 ch1 OFLAG
-
-  // STORE CLOCK & !OUTPUT ENABLE
-  TMR1_SCTRL2 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;          // Timer Channel Status and Control Register  // enable output | invert polarity | set output to ~1
-  TMR1_CSCTRL2 = 0;                                                                       // reset to 0, is set by pwm init code otherwise
-  TMR1_LOAD2 = 65537 - (PERIOD - OEHIGH);                                                 // low time  (65537 - x) -
-  TMR1_COMP12 = OEHIGH;                                                                   // high time (0 = always low, max = LOAD-1)
-  TMR1_CTRL2 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH | TMR_CTRL_OUTMODE(6);  // Control Register
-  *(portConfigRegister(11)) = 1;                                                          // set pin 14 to output TMR1 ch1 OFLAG
-
-  // route the timer outputs through XBAR to edge trigger DMA request
-  CCM_CCGR2 |= CCM_CCGR2_XBAR1(CCM_CCGR_ON);
-  xbar_connect(XBARA1_IN_QTIMER3_TIMER0, XBARA1_OUT_DMA_CH_MUX_REQ30);
-
-  XBARA1_CTRL0 = XBARA_CTRL_STS0 | XBARA_CTRL_EDGE0(3) | XBARA_CTRL_DEN0;
-
-  // configure DMA channels
-  dmanext.TCD->SADDR = bitdata;
-  dmanext.TCD->SOFF = 4;
-  dmanext.TCD->ATTR = DMA_TCD_ATTR_SSIZE(2) | DMA_TCD_ATTR_DSIZE(2);
-  dmanext.TCD->NBYTES_MLOFFYES = DMA_TCD_NBYTES_MLOFFYES_NBYTES(4);
-  dmanext.TCD->SLAST = 0;
-  dmanext.TCD->DADDR = &GPIO2_DR;
-  dmanext.TCD->DOFF = 0;
-  dmanext.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8 * 16;
-  dmanext.TCD->DLASTSGA = (int32_t)(dmanext.TCD);
-  dmanext.TCD->BITER_ELINKNO = BYTES_PER_DMA * 8 * 16;
-  dmanext.TCD->CSR = DMA_TCD_CSR_DONE;
-
+  /* DMA channel: FlexIO2 shifter 0 request -> 32-byte groups into SHIFTBUF0..7 */
   dma.begin();
-  dma = dmanext;  // copies TCD
-  dma.triggerAtHardwareEvent(DMAMUX_SOURCE_XBAR1_0);
-  dma.attachInterrupt(isr);
+  if (dma.TCD == nullptr || dma.channel >= DMA_NUM_CHANNELS) {
+    initError = ERR_DMA;
+    return;
+  }
+  dma.disable();
+  dma.triggerAtHardwareEvent(DMAMUX_SOURCE_FLEXIO2_REQUEST0);
+  dma.attachInterrupt(isr, 64);
+#if SHIFTWS2811_DMA_PRIORITY
+  raiseDmaPriority(dma.channel);
+#endif
+  setZeroTcd(dmazero.TCD);
 
-  // set up the buffers
-  uint32_t bufsize = numbytes * numpins * 16;
+  attachInterruptVector(IRQ_FLEXIO2, flexisr);
+  NVIC_SET_PRIORITY(IRQ_FLEXIO2, 96);
+  NVIC_ENABLE_IRQ(IRQ_FLEXIO2);
+
+  /* pixel buffers */
+  uint32_t bufsize = numbytes * numpins * SHIFTWS_SR_LEN;
   memset(frontBuffer, 0, bufsize);
   if (drawBuffer) {
     memset(drawBuffer, 0, bufsize);
@@ -212,12 +562,12 @@ void ShiftWS2811::begin(void) {
   }
 }
 
-void ShiftWS2811::setBrightness(double bri) {
+FLASHMEM void ShiftWS2811::setBrightness(double bri) {
   brightness = max(bri, 0);
   gammaLUTCalc(brightness, gammaCorrection);
 }
 
-byte ShiftWS2811::setDitherBits(byte ditBits) {
+FLASHMEM byte ShiftWS2811::setDitherBits(byte ditBits) {
   ditherBits = ditBits;
   if (ditherBits == 255) {
     ditherBits = 0;
@@ -227,56 +577,59 @@ byte ShiftWS2811::setDitherBits(byte ditBits) {
       ditherBits++;
     }
   }
-  if (ditherBits > MAX_DITHER_BITS)
-    ditherBits = MAX_DITHER_BITS;
+  if (ditherBits > MAX_DITHER_BITS) ditherBits = MAX_DITHER_BITS;
   ditherCycle = 0;
   return ditherBits;
 }
 
-static void fillbits(uint32_t *dest, const uint8_t *pixels, int n, uint32_t mask, const uint8_t *ditheredLUT) {
-  do {
-    uint8_t pix = ditheredLUT[*pixels++];
-    if ((pix & 0x80)) *dest |= mask;
-    dest += 16;  // *16 for pins on SR
-    if ((pix & 0x40)) *dest |= mask;
-    dest += 16;
-    if ((pix & 0x20)) *dest |= mask;
-    dest += 16;
-    if ((pix & 0x10)) *dest |= mask;
-    dest += 16;
-    if ((pix & 0x08)) *dest |= mask;
-    dest += 16;
-    if ((pix & 0x04)) *dest |= mask;
-    dest += 16;
-    if ((pix & 0x02)) *dest |= mask;
-    dest += 16;
-    if ((pix & 0x01)) *dest |= mask;
-    dest += 16;
-  } while (--n > 0);
+uint32_t ShiftWS2811::underruns(void) { return underrunCount; }
+uint32_t ShiftWS2811::frames(void) { return frameCount; }
+uint32_t ShiftWS2811::stalls(void) { return stallCount; }
+uint8_t ShiftWS2811::error(void) { return initError; }
+uint32_t ShiftWS2811::bitPeriodNs(void) { return SHIFTWS2811_BIT_NS; }
+uint32_t ShiftWS2811::frameTimeUs(void) {
+  return (uint32_t)(((uint64_t)numbytes * 8 + 1) * SHIFTWS2811_BIT_NS / 1000) + SHIFTWS2811_RESET_US;
 }
 
 void ShiftWS2811::fillAllBits(uint32_t *dest, uint32_t index, uint32_t count) {
-  for (uint32_t i = 0; i < numpins; i++) {
-    if (pin_offset[i] != 1) continue;
-    for (uint32_t j = 0; j < 16; j++) {                     // 16 pins on the SR
-      ditherCycle = (ditherCycle + 1) % (1 << ditherBits);  // apply an offset to the dithering according to the pin number
-      const uint8_t *ditheredLUT = gammaLUT + (ditherCycle << 8);
-      fillbits(dest + 15 - j, (uint8_t *)frontBuffer + index + i * numbytes * 16 + j * numbytes, count, 1 << pin_bitnum[i], ditheredLUT);
-    }
-  }
-  arm_dcache_flush_delete(dest, count * 8 * 16 * 4);
+  shiftws_fillColumns(&plan, dest, index, count);
+  arm_dcache_flush_delete(dest, count * SHIFTWS_BITS_PER_BYTE * plan.layout.wordsPerBit * sizeof(uint32_t));
+}
+
+/* Stop everything and re-arm the timers.  Used when a frame never finished,
+   which can only happen if the FlexIO chain is not behaving as designed. */
+void ShiftWS2811::restartEngine(void) {
+  IMXRT_FLEXIO_t &f = IMXRT_FLEXIO2_S;
+  f.TIMCTL[TMR_SHIFT] = 0;
+  dma.disable();
+  configureTimers(numbytes * SHIFTWS_BITS_PER_BYTE);
+  f.SHIFTERR = 0xFF;
+  f.TIMSTAT = 0xFF;
+  transferring = false;
 }
 
 void ShiftWS2811::show(void) {
-  while (new_frame);  // wait till the last new frame has been attented to
-  if (drawBuffer != backBuffer)
-    memcpy(backBuffer, drawBuffer, numbytes * numpins * 16);
+  if (initError) return;
+  // wait till the last new frame has been attended to; if the frame engine
+  // never comes back, restart it instead of hanging (see stalls())
+  const uint32_t start = micros();
+  const uint32_t limit = 4 * frameTimeUs() + 10000;
+  while (new_frame) {
+    if (micros() - start > limit) {
+      stallCount++;
+      restartEngine();
+      break;
+    }
+  }
+  if (drawBuffer != backBuffer) memcpy(backBuffer, drawBuffer, numbytes * numpins * SHIFTWS_SR_LEN);
   new_frame = true;
-
-  if (!transferring)
-    transfer();
+  if (!transferring) transfer();
 }
 
+int ShiftWS2811::busy(void) { return transferring; }
+
+/* Start one frame.  Called from show() when idle, otherwise from the FlexIO
+   interrupt at the end of the reset gap. */
 void ShiftWS2811::transfer(void) {
   if (new_frame) {  // point frontBuffer to the newly copied frame waiting in backBuffer
     void *temp = backBuffer;
@@ -284,135 +637,94 @@ void ShiftWS2811::transfer(void) {
     frontBuffer = temp;
     new_frame = false;
   }
-  ditherCycle = (ditherCycle + 1) % (1 << ditherBits);
 
-  GPIO2_DR = 0;
-
-  // disable timers
-  TMR1_ENBL &= ~0b0111;  // turn off all timers
-  TMR3_ENBL &= ~0b0001;
-
-  // force all timer outputs to logic low
-  TMR3_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_FORCE;
-  TMR1_SCTRL0 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;
-  TMR1_SCTRL1 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;
-  TMR1_SCTRL2 = TMR_SCTRL_OEN | TMR_SCTRL_OPS | TMR_SCTRL_VAL | TMR_SCTRL_FORCE;
-
-  // clear any prior pending DMA requests
-  XBARA1_CTRL0 |= XBARA_CTRL_STS1 | XBARA_CTRL_STS0;
-  XBARA1_CTRL1 |= XBARA_CTRL_STS0;
-
-  // fill the DMA transmit buffer
-  memset(bitdata, 0, sizeof(bitdata));
-  uint32_t count = numbytes;
-  if (count > BYTES_PER_DMA * 2) count = BYTES_PER_DMA * 2;
-  frontbuffer_index = count;
-
-  fillAllBits(bitdata, 0, count);
-
-  // set up DMA transfers
-  if (numbytes <= BYTES_PER_DMA * 2) {
-    dma.TCD->SADDR = bitdata;
-    dma.TCD->DADDR = &GPIO2_DR;
-    dma.TCD->CITER_ELINKNO = count * 8 * 16;
-    dma.TCD->CSR = DMA_TCD_CSR_DREQ | DMA_TCD_CSR_INTMAJOR;
-  } else {
-    dma.TCD->SADDR = bitdata;
-    dma.TCD->DADDR = &GPIO2_DR;
-    dma.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8 * 16;
-    dma.TCD->CSR = 0;
-    dma.TCD->CSR = DMA_TCD_CSR_INTMAJOR | DMA_TCD_CSR_ESG;
-    dmanext.TCD->SADDR = bitdata + BYTES_PER_DMA * 8 * 16;
-    dmanext.TCD->CITER_ELINKNO = BYTES_PER_DMA * 8 * 16;
-    if (numbytes <= BYTES_PER_DMA * 3) {
-      dmanext.TCD->CSR = DMA_TCD_CSR_ESG;
+  /* dithering: advance one step per frame, offset by shift register output */
+  const uint32_t ditherMask = (1u << ditherBits) - 1;
+  ditherCycle = (ditherCycle + 1) & ditherMask;
+  const uint8_t *base = (const uint8_t *)frontBuffer;
+  for (uint32_t idx = 0; idx < SHIFTWS_MAX_CHAINS * SHIFTWS_SR_LEN; idx++) {
+    if (idx < (uint32_t)numpins * SHIFTWS_SR_LEN) {
+      plan.pixels[idx] = base + idx * numbytes;
+      plan.lut[idx] = gammaLUT + (((ditherCycle + idx + 1) & ditherMask) << 8);
     } else {
-      dmanext.TCD->CSR = DMA_TCD_CSR_ESG | DMA_TCD_CSR_INTMAJOR;
+      plan.pixels[idx] = base;
+      plan.lut[idx] = zeroLUT;
     }
-    dma_first = true;
   }
+
+  /* convert the first one or two buffers */
+  const uint32_t wordsPerColumn = SHIFTWS_BITS_PER_BYTE * plan.layout.wordsPerBit;
+  fillCol = 0;
+  fillHalf = 0;
+  uint32_t count = umin(numbytes, SHIFTWS2811_BYTES_PER_DMA);
+  fillAllBits(bitdata[0], 0, count);
+  fillCol = count;
+  setDataTcd(dma.TCD, bitdata[0], count * wordsPerColumn, dmanext.TCD);
+  if (fillCol < numbytes) {
+    count = umin(numbytes - fillCol, SHIFTWS2811_BYTES_PER_DMA);
+    fillAllBits(bitdata[1], fillCol, count);
+    fillCol += count;
+    setDataTcd(dmanext.TCD, bitdata[1], count * wordsPerColumn, fillCol < numbytes ? (void *)dmanext.TCD : (void *)dmazero.TCD);
+  } else {
+    dmanext = dmazero;
+  }
+
+  /* arm FlexIO: fresh shifters (status flags set -> DMA prefill), clear stale flags */
+  IMXRT_FLEXIO_t &f = IMXRT_FLEXIO2_S;
+  configureShifters();
+  f.SHIFTERR = 0xFF;
+  f.TIMSTAT = 0xFF;
+
   dma.clearComplete();
-  dma.enable();
+  dma.clearInterrupt();
+  dma.enable();  /* prefill of SHIFTBUF0..7 happens now */
 
-  // initialize timers // for TMR3_COMP10 = 18
-  TMR3_CNTR0 = DMA_TICS - 1;            // DMA trigger
-  TMR1_CNTR0 = 65537 - (DMA_TICS + 4);  // SHIFT CLOCK
-  TMR1_CNTR1 = 46;                      // WAVEFORM
-  TMR1_CNTR2 = 0;                       // STORE CLOCK, (delay set below)
-
-  // wait for WS2812 reset
-  while (sinceFinish < 80);
-#ifdef DEBUG_SCOPE
-  digitalWrite(0, HIGH);
-#endif
-  // start everything running!
-  TMR3_ENBL |= 0b0001;  // enable DMA trigger clock
-  TMR1_ENBL |= 0b0011;  // enable SHIFT CLOCK & COMMON WAVEFORM
-  uint32_t begin = ARM_DWT_CYCCNT;
-  while (ARM_DWT_CYCCNT - begin < DMA_TICS - 10);  // delay the start of the STORE CLOCK
-  TMR1_ENBL |= 0b0100;                             // enable TMR3 STORE CLOCK
+  /* the shift clock starts as soon as SHIFTBUF7 is written; timers 1, 2 and
+     5 start with it and the waveform timers follow at their fixed delays */
+  f.TIMCTL[TMR_SHIFT] = shiftClkTimctl;
   transferring = true;
-#ifdef DEBUG_SCOPE
-  digitalWrite(0, LOW);
-#endif
 }
 
+/* DMA interrupt: one conversion buffer has been consumed, refill it. */
 void ShiftWS2811::isr(void) {
-  // first ack the interrupt
   dma.clearInterrupt();
+  asm volatile("dsb");
+  if (fillCol >= numbytes) return;  // the zero stream is running now
+  uint32_t *dest = bitdata[fillHalf];
+  const uint32_t count = umin(numbytes - fillCol, SHIFTWS2811_BYTES_PER_DMA);
+  fillAllBits(dest, fillCol, count);
+  fillCol += count;
+  fillHalf ^= 1;
+  setDataTcd(dmanext.TCD, dest, count * SHIFTWS_BITS_PER_BYTE * plan.layout.wordsPerBit,
+             fillCol < numbytes ? (void *)dmanext.TCD : (void *)dmazero.TCD);
+}
 
-  if (frontbuffer_index >= numbytes) {
-    uint32_t begin = ARM_DWT_CYCCNT;
-    while (ARM_DWT_CYCCNT - begin < PERIOD * 1.5);
-    TMR1_ENBL &= ~0b0111;  // turn off all timers
-    TMR3_ENBL &= ~0b0001;
-    sinceFinish = 0;
-    if ((gammaCorrection && ditherBits > 0) || new_frame)  // if we apply gamma correction, dithering is on or there is a new frame waiting to be shown
-      transfer();                                          // continue dithering the current frame
+/* FlexIO interrupt: end of frame (timer 5) and end of the reset gap (timer 4). */
+void ShiftWS2811::flexisr(void) {
+  IMXRT_FLEXIO_t &f = IMXRT_FLEXIO2_S;
+  const uint32_t status = f.TIMSTAT;
+  if (status & (1 << TMR_END)) {
+    f.TIMSTAT = 1 << TMR_END;
+    f.TIMCTL[TMR_SHIFT] = 0;  // stop the shift clock; STORE and COMMON already stopped in hardware
+    dma.disable();
+    if (f.SHIFTERR & 0xFF) {
+      underrunCount++;
+      f.SHIFTERR = 0xFF;
+    }
+    frameCount++;
+  }
+  if (status & (1 << TMR_GAP)) {
+    f.TIMSTAT = 1 << TMR_GAP;
+    if ((gammaCorrection && ditherBits > 0) || new_frame)  // keep dithering the current frame, or show the new one
+      transfer();
     else
       transferring = false;
-    return;
   }
-
-  // fill (up to) half the transmit buffer with new data
-  uint32_t *dest;
-  if (dma_first) {
-    dma_first = false;
-    dest = bitdata;
-  } else {
-    dma_first = true;
-    dest = bitdata + BYTES_PER_DMA * 8 * 16;
-  }
-
-  memset(dest, 0, sizeof(bitdata) / 2);
-  uint32_t index = frontbuffer_index;
-  uint32_t count = numbytes - frontbuffer_index;
-  if (count > BYTES_PER_DMA) count = BYTES_PER_DMA;
-  frontbuffer_index = index + count;
-
-  fillAllBits(dest, index, count);
-
-  // queue it for the next DMA transfer
-  dmanext.TCD->SADDR = dest;
-  dmanext.TCD->CITER_ELINKNO = count * 8 * 16;
-  uint32_t remain = numbytes - (index + count);
-  if (remain == 0) {
-    dmanext.TCD->CSR = DMA_TCD_CSR_DREQ | DMA_TCD_CSR_INTMAJOR;
-  } else if (remain <= BYTES_PER_DMA) {
-    dmanext.TCD->CSR = DMA_TCD_CSR_ESG;
-  } else {
-    dmanext.TCD->CSR = DMA_TCD_CSR_ESG | DMA_TCD_CSR_INTMAJOR;
-  }
-}
-
-int ShiftWS2811::busy(void) {
-  return transferring;
+  asm volatile("dsb");
 }
 
 // For Teensy 4.x, the pixel data is stored in ordinary RGB format.  Translation
-// from 24 bit color to GPIO bitmasks is done on-the-fly by fillbits().  This is
-// different from Teensy 3.x, where the data was stored as bytes to write directly
-// to the GPIO output register.
+// from 24 bit color to the shift register bit stream is done on-the-fly.
 
 void ShiftWS2811::setPixel(uint32_t num, int color) {
   if ((params & 0x1F) < 6) {

@@ -1,6 +1,8 @@
-/*  ShiftWS2811 - High Performance WS2811 LED Display Library
-    http://www.pjrc.com/teensy/td_libs_ShiftWS2811.html
-    Copyright (c) 2013 Paul Stoffregen, PJRC.COM, LLC
+/*  ShiftWS2811 - 128 channel WS2811 LED driver through 74HC595 shift registers
+    FlexIO2 + eDMA implementation for Teensy 4.1
+
+    Copyright (c) 2013 Paul Stoffregen, PJRC.COM, LLC (OctoWS2811 origins)
+    Copyright (c) 2026 Emiel Harmsen
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to deal
@@ -71,7 +73,9 @@
 class ShiftWS2811 {
  public:
 #if defined(__IMXRT1062__)
-  // Teensy 4.x can use any arbitrary group of pins!
+  // Data pins must be Teensy 4.1 pins on FlexIO2 (6, 7, 8, 9, 13, 32, 34, 35,
+  // 36, 37); pins 10, 11 and 12 carry the shift clock, store/output enable and
+  // COMMON waveform.  See ShiftWS2811.cpp for the compile time timing options.
   ShiftWS2811(uint32_t numPerStrip, void *frontBuf, void *backBuf, void *drawBuf, uint8_t config = WS2811_GRB, uint8_t numPins = 8, const uint8_t *pinList = defaultPinList, bool gammaCorr = true, byte ditBits = 255);
   void begin(uint32_t numPerStrip, void *frontBuf, void *backBuf, void *drawBuf, uint8_t config = WS2811_GRB, uint8_t numPins = 8, const uint8_t *pinList = defaultPinList, bool gammaCorr = true, byte ditBits = 255);
   int numPixels(void);
@@ -107,6 +111,25 @@ class ShiftWS2811 {
   void show(void);
   int busy(void);
 
+  // Diagnostics
+  uint32_t frames(void);       // frames transmitted since begin()
+  uint32_t underruns(void);    // frames in which the DMA was late refilling the FlexIO shifters (visible glitch)
+  uint32_t stalls(void);       // frames that never finished and were restarted by show() (FlexIO chain problem)
+  uint8_t error(void);         // 0 when begin() succeeded, otherwise one of the ERR_ codes below
+  uint32_t bitPeriodNs(void);  // configured WS2811 bit period
+  uint32_t frameTimeUs(void);  // time from the start of one frame to the earliest start of the next
+
+  enum {
+    ERR_NONE = 0,
+    ERR_PIN_NOT_FLEXIO = 1,  // a data or clock pin is not a FlexIO2 pin
+    ERR_PIN_RANGE = 2,       // a clock pin lies inside the parallel data pin range
+    ERR_NUM_PINS = 3,        // 1..16 data pins are supported
+    ERR_STRIP_LENGTH = 4,    // more than 4096 colour bytes per shift register output
+    ERR_FLEXIO = 5,          // FlexIO2 does not report 8 shifters and 8 timers
+    ERR_PLL = 6,             // the video PLL did not lock
+    ERR_DMA = 7,             // no free DMA channel
+  };
+
   int color(uint8_t red, uint8_t green, uint8_t blue) {
     return (red << 16) | (green << 8) | blue;
   }
@@ -127,7 +150,9 @@ class ShiftWS2811 {
   static DMAChannel dma;
   static void fillAllBits(uint32_t *dest, uint32_t index, uint32_t count);
   static void transfer();
-  static void isr(void);
+  static void isr(void);      // DMA: conversion buffer consumed
+  static void flexisr(void);  // FlexIO: frame end and reset gap
+  static void restartEngine(void);
   static uint8_t defaultPinList[8];
 };
 

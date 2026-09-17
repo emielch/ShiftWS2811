@@ -76,6 +76,9 @@ class ShiftWS2811 {
   // Data pins must be Teensy 4.1 pins on FlexIO2 (6, 7, 8, 9, 13, 32, 34, 35,
   // 36, 37); pins 10, 11 and 12 carry the shift clock, store/output enable and
   // COMMON waveform.  See ShiftWS2811.cpp for the compile time timing options.
+  // The three buffers hold numPerStrip * 3 (or 4) * 16 bytes per data pin and
+  // must be allocated for a multiple of 8 data pins (the converter reads the
+  // pins in groups of 8; surplus chains are ignored but must be readable).
   ShiftWS2811(uint32_t numPerStrip, void *frontBuf, void *backBuf, void *drawBuf, uint8_t config = WS2811_GRB, uint8_t numPins = 8, const uint8_t *pinList = defaultPinList, bool gammaCorr = true, byte ditBits = 255);
   void begin(uint32_t numPerStrip, void *frontBuf, void *backBuf, void *drawBuf, uint8_t config = WS2811_GRB, uint8_t numPins = 8, const uint8_t *pinList = defaultPinList, bool gammaCorr = true, byte ditBits = 255);
   int numPixels(void);
@@ -118,6 +121,8 @@ class ShiftWS2811 {
   uint8_t error(void);         // 0 when begin() succeeded, otherwise one of the ERR_ codes below
   uint32_t bitPeriodNs(void);  // configured WS2811 bit period
   uint32_t frameTimeUs(void);  // time from the start of one frame to the earliest start of the next
+  float cpuLoad(void);         // percent of CPU time spent converting/driving since the previous call
+                               // (call at least every few seconds; the first call measures since begin())
 
   enum {
     ERR_NONE = 0,

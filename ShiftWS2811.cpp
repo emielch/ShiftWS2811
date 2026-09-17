@@ -85,6 +85,11 @@
    stops the shift clock, so the shifters never underrun at the frame end.  A
    real underrun during a frame sets SHIFTERR, which is counted per frame and
    available through underruns().
+
+   CPU cost: the colour to bit-stream conversion (ShiftWS2811_fill.h) runs in
+   the DMA interrupt, about 1500 instructions per LED byte column (128 pixel
+   bytes).  Frames are sent back to back (dithering re-sends the current
+   frame), so this is a continuous background load; cpuLoad() reports it.
    =========================================================================== */
 
 /* ------------------------------------------------------------------ tuning */
@@ -102,7 +107,7 @@
 #define SHIFTWS2811_RESET_US 80 /* low time between frames */
 #endif
 #ifndef SHIFTWS2811_BYTES_PER_DMA
-#define SHIFTWS2811_BYTES_PER_DMA 6 /* LED bytes converted per DMA interrupt (two buffers) */
+#define SHIFTWS2811_BYTES_PER_DMA 12 /* LED bytes converted per DMA interrupt (two buffers, 6 KB each in OCRAM) */
 #endif
 #ifndef SHIFTWS2811_SHIFT_DIV
 #define SHIFTWS2811_SHIFT_DIV 3 /* shift clock period = 2 * (DIV + 1) FlexIO clocks */
@@ -115,6 +120,9 @@
 #endif
 #ifndef SHIFTWS2811_DMA_PRIORITY
 #define SHIFTWS2811_DMA_PRIORITY 1 /* 1: give the DMA channel the highest fixed priority of its group */
+#endif
+#ifndef SHIFTWS2811_BITDATA_DTCM
+#define SHIFTWS2811_BITDATA_DTCM 0 /* 1: conversion buffers in DTCM (no cache maintenance, the eDMA reads them through the core's AHBS port), 0: OCRAM */
 #endif
 #ifndef SHIFTWS2811_PIN_SHIFT_CLK
 #define SHIFTWS2811_PIN_SHIFT_CLK 10 /* 74HC595 SRCLK   (FlexIO2 D0) */
@@ -202,11 +210,14 @@ static uint8_t flexStorePin;
 static uint8_t flexCommonPin;
 static uint32_t shiftClkTimctl;  /* TIMCTL value that starts the shift clock */
 static ShiftWSFillPlan plan;
-static uint8_t zeroLUT[256];
 
 static const uint32_t WORDS_PER_GROUP = 8; /* one DMA minor loop = SHIFTBUF0..7 */
 static const uint32_t HALF_WORDS = SHIFTWS2811_BYTES_PER_DMA * SHIFTWS_BITS_PER_BYTE * SHIFTWS_SR_LEN; /* worst case: 16 words per bit */
+#if SHIFTWS2811_BITDATA_DTCM
+static uint32_t bitdata[2][HALF_WORDS] __attribute__((used, aligned(32)));
+#else
 DMAMEM static uint32_t bitdata[2][HALF_WORDS] __attribute__((used, aligned(32)));
+#endif
 DMAMEM static uint32_t zeroWords[WORDS_PER_GROUP] __attribute__((used, aligned(32)));
 static DMASetting dmanext; /* loaded by scatter/gather when the running buffer completes */
 static DMASetting dmazero; /* endless stream of zero words after the last data buffer */
@@ -218,6 +229,8 @@ static volatile bool new_frame = false;
 static volatile uint32_t underrunCount = 0;
 static volatile uint32_t frameCount = 0;
 static volatile uint32_t stallCount = 0;
+static volatile uint32_t loadCycles = 0; /* DWT cycles spent in the library's interrupts and transfer() */
+static uint32_t loadCyclesRef = 0, loadTimeRef = 0;
 static uint8_t initError = 0;
 
 /* -------------------------------------------------------------- utilities */
@@ -502,11 +515,12 @@ FLASHMEM void ShiftWS2811::begin(void) {
   plan.numGroups = (numpins + SHIFTWS_CHAINS_PER_GROUP - 1) / SHIFTWS_CHAINS_PER_GROUP;
   shiftws_buildSpread(&plan);
   shiftws_buildExpand(&plan, lanes, numpins);
-  memset(zeroLUT, 0, sizeof(zeroLUT));
 
   /* conversion buffers and the zero group live in OCRAM for the DMA */
   memset(bitdata, 0, sizeof(bitdata));
+#if !SHIFTWS2811_BITDATA_DTCM
   arm_dcache_flush_delete(bitdata, sizeof(bitdata));
+#endif
   memset(zeroWords, 0, sizeof(zeroWords));
   arm_dcache_flush_delete(zeroWords, sizeof(zeroWords));
 
@@ -552,6 +566,10 @@ FLASHMEM void ShiftWS2811::begin(void) {
   NVIC_SET_PRIORITY(IRQ_FLEXIO2, 96);
   NVIC_ENABLE_IRQ(IRQ_FLEXIO2);
 
+  loadCycles = 0;
+  loadCyclesRef = 0;
+  loadTimeRef = ARM_DWT_CYCCNT;
+
   /* pixel buffers */
   uint32_t bufsize = numbytes * numpins * SHIFTWS_SR_LEN;
   memset(frontBuffer, 0, bufsize);
@@ -590,10 +608,21 @@ uint32_t ShiftWS2811::bitPeriodNs(void) { return SHIFTWS2811_BIT_NS; }
 uint32_t ShiftWS2811::frameTimeUs(void) {
   return (uint32_t)(((uint64_t)numbytes * 8 + 1) * SHIFTWS2811_BIT_NS / 1000) + SHIFTWS2811_RESET_US;
 }
+float ShiftWS2811::cpuLoad(void) {
+  const uint32_t now = ARM_DWT_CYCCNT;
+  const uint32_t busy = loadCycles;
+  const uint32_t dBusy = busy - loadCyclesRef;
+  const uint32_t dTime = now - loadTimeRef; /* the cycle counter wraps every 5 s at 816 MHz */
+  loadCyclesRef = busy;
+  loadTimeRef = now;
+  return dTime ? 100.0f * (float)dBusy / (float)dTime : 0.0f;
+}
 
 void ShiftWS2811::fillAllBits(uint32_t *dest, uint32_t index, uint32_t count) {
   shiftws_fillColumns(&plan, dest, index, count);
+#if !SHIFTWS2811_BITDATA_DTCM
   arm_dcache_flush_delete(dest, count * SHIFTWS_BITS_PER_BYTE * plan.layout.wordsPerBit * sizeof(uint32_t));
+#endif
 }
 
 /* Stop everything and re-arm the timers.  Used when a frame never finished,
@@ -623,7 +652,13 @@ void ShiftWS2811::show(void) {
   }
   if (drawBuffer != backBuffer) memcpy(backBuffer, drawBuffer, numbytes * numpins * SHIFTWS_SR_LEN);
   new_frame = true;
-  if (!transferring) transfer();
+  if (!transferring) {
+    const uint32_t t0 = ARM_DWT_CYCCNT;
+    transfer();
+    __disable_irq();
+    loadCycles += ARM_DWT_CYCCNT - t0;
+    __enable_irq();
+  }
 }
 
 int ShiftWS2811::busy(void) { return transferring; }
@@ -638,18 +673,18 @@ void ShiftWS2811::transfer(void) {
     new_frame = false;
   }
 
-  /* dithering: advance one step per frame, offset by shift register output */
+  /* dithering: advance one step per frame.  The phase of (chain i, output j)
+     is (cycle + 16*i + j + 1) mod 2^ditherBits as in the original driver; it
+     only depends on the parity of i because 16*i mod 32 is 0 or 16. */
   const uint32_t ditherMask = (1u << ditherBits) - 1;
   ditherCycle = (ditherCycle + 1) & ditherMask;
   const uint8_t *base = (const uint8_t *)frontBuffer;
-  for (uint32_t idx = 0; idx < SHIFTWS_MAX_CHAINS * SHIFTWS_SR_LEN; idx++) {
-    if (idx < (uint32_t)numpins * SHIFTWS_SR_LEN) {
-      plan.pixels[idx] = base + idx * numbytes;
-      plan.lut[idx] = gammaLUT + (((ditherCycle + idx + 1) & ditherMask) << 8);
-    } else {
-      plan.pixels[idx] = base;
-      plan.lut[idx] = zeroLUT;
-    }
+  plan.chainStride = SHIFTWS_SR_LEN * numbytes;
+  for (uint32_t j = 0; j < SHIFTWS_SR_LEN; j++) {
+    for (uint32_t g = 0; g < SHIFTWS_MAX_GROUPS; g++)
+      plan.pixels[g][j] = base + (g * SHIFTWS_CHAINS_PER_GROUP * SHIFTWS_SR_LEN + j) * numbytes;
+    plan.lut[0][j] = gammaLUT + (((ditherCycle + j + 1) & ditherMask) << 8);
+    plan.lut[1][j] = gammaLUT + (((ditherCycle + SHIFTWS_SR_LEN + j + 1) & ditherMask) << 8);
   }
 
   /* convert the first one or two buffers */
@@ -687,20 +722,24 @@ void ShiftWS2811::transfer(void) {
 
 /* DMA interrupt: one conversion buffer has been consumed, refill it. */
 void ShiftWS2811::isr(void) {
+  const uint32_t t0 = ARM_DWT_CYCCNT;
   dma.clearInterrupt();
   asm volatile("dsb");
-  if (fillCol >= numbytes) return;  // the zero stream is running now
-  uint32_t *dest = bitdata[fillHalf];
-  const uint32_t count = umin(numbytes - fillCol, SHIFTWS2811_BYTES_PER_DMA);
-  fillAllBits(dest, fillCol, count);
-  fillCol += count;
-  fillHalf ^= 1;
-  setDataTcd(dmanext.TCD, dest, count * SHIFTWS_BITS_PER_BYTE * plan.layout.wordsPerBit,
-             fillCol < numbytes ? (void *)dmanext.TCD : (void *)dmazero.TCD);
+  if (fillCol < numbytes) {  // otherwise the zero stream is running now
+    uint32_t *dest = bitdata[fillHalf];
+    const uint32_t count = umin(numbytes - fillCol, SHIFTWS2811_BYTES_PER_DMA);
+    fillAllBits(dest, fillCol, count);
+    fillCol += count;
+    fillHalf ^= 1;
+    setDataTcd(dmanext.TCD, dest, count * SHIFTWS_BITS_PER_BYTE * plan.layout.wordsPerBit,
+               fillCol < numbytes ? (void *)dmanext.TCD : (void *)dmazero.TCD);
+  }
+  loadCycles += ARM_DWT_CYCCNT - t0;
 }
 
 /* FlexIO interrupt: end of frame (timer 5) and end of the reset gap (timer 4). */
 void ShiftWS2811::flexisr(void) {
+  const uint32_t t0 = ARM_DWT_CYCCNT;
   IMXRT_FLEXIO_t &f = IMXRT_FLEXIO2_S;
   const uint32_t status = f.TIMSTAT;
   if (status & (1 << TMR_END)) {
@@ -720,6 +759,7 @@ void ShiftWS2811::flexisr(void) {
     else
       transferring = false;
   }
+  loadCycles += ARM_DWT_CYCCNT - t0;
   asm volatile("dsb");
 }
 

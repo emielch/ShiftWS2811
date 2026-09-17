@@ -8,9 +8,9 @@ of which PJRC hosts at <https://www.pjrc.com/teensy/IMXRT1060RM_rev3.pdf>.
 The FlexIO chapter is chapter 50 (pages 2943 to 3040 of that PDF), the CCM is
 chapter 14, the eDMA chapter 6, the IOMUXC chapter 11.
 
-Status at the time of writing: the code compiles into the QuinCube firmware and
-the bit-stream conversion passes its host test, but nothing has run on the real
-board yet.  Section 8 lists what a scope must confirm.
+Status: the code runs on the QuinCube (2026-09-17: LEDs correct at 800 kHz on
+the first try).  Section 6 lists what a scope should still confirm, section 10
+the CPU load findings from that first run and the resulting fill core rewrite.
 
 ---------------------------------------------------------------------------
 
@@ -402,20 +402,45 @@ FlexIOpin[i] - PINSEL` of each shift (lanes 0, 7, 6, 1, 19, 18, 8, 9 for the
 QuinCube pin list).  For 32-bit shifts this is 16 words per bit, one per
 shift, and 2 DMA minor loops per bit.
 
-Algorithm per (column, shift): the 8 gamma/dither-corrected bytes of the 8
-chains are spread with a 256 x 64-bit table so that byte `s` of a 64-bit
-accumulator holds bit `7-s` of every chain (`acc |= spread[x] << i`), then
-each byte is mapped with a 256 x 32-bit table onto the lane positions and
-OR-ed into the word of WS2811 bit `s`.  8 loads + 8 stores per 8 bytes
-instead of 64 test-and-OR steps; about 4 to 5 times fewer instructions than
-the old `fillbits`.  Chains beyond `numPins` use an all-zero LUT.  Up to 16
-chains (two groups) are supported.  The host test
-(`test/host_fill_test.c`, plain C99, `gcc -std=c99 -O2 -I.. host_fill_test.c`)
-compares it with a bit-by-bit reference for all widths and chain counts.
+Algorithm (second version, 2026-09-17): loops are ordered output `j` (16),
+group, column, and the 8 chains of a group are unrolled.  Per (output,
+column): the 8 pixel bytes are read with a fixed stride (`chainStride =
+16 * numbytes`), corrected through the 256-entry gamma/dither table of that
+output (one table for even, one for odd chains), spread with a 256 x 64-bit
+table so that byte `s` of the accumulator holds bit `7-s` of every chain
+(chain `i` at bit `i`), and each byte is mapped with a 256 x 32-bit table
+onto the lane positions and stored as the word of WS2811 bit `s`.  The two
+32-bit halves of the accumulator are kept apart: a spread value shifted by
+at most 7 never crosses a word boundary, so everything stays in 32-bit
+registers (`orr rd, rd, rm, lsl #i`).  For 32-bit shifts with one group
+every destination word is written exactly once (no memset, no
+read-modify-write); other layouts OR into a zeroed buffer (generic, slower
+path; specialise it before relying on it for a new board).
+
+Cost (GCC 15, -O2, Cortex-M7): 93 instructions and about 40 memory accesses
+per output and column, i.e. about 1500 instructions per LED byte column, all
+in DTCM (pixels, gamma LUT, plan) except the destination writes to the OCRAM
+conversion buffer.  The first version (per-chain pointer tables, 64-bit
+shifts, read-modify-write, memset) compiled to 195 instructions per shift
+with heavy stack spilling, 3000+ per column, about the cost of the old
+`fillbits`, and caused the frame rate drop described in section 10.  On an
+x86 host the second version is 3.3x faster than the first
+(`gcc -O2 -DBENCH`: 68 vs 220 ns per column).
+
+Chains beyond `numPins` in the last group are read (the pixel buffers must
+be sized for a multiple of 8 chains) but contribute nothing because
+`shiftws_buildExpand` leaves their lane bits out.  Up to 16 chains (two
+groups) are supported.  The host test (`test/host_fill_test.c`, plain C99,
+`gcc -std=c99 -O2 -I.. host_fill_test.c`, `-DBENCH` adds a timing loop)
+compares it with a bit-by-bit reference for all widths, chain counts and
+three chunk sizes (133 cases).
 
 Dither phase for output `(chain i, output j)` is
 `(frameCycle + i*16 + j + 1) mod 2^ditherBits`, identical to the old code
 (which incremented `ditherCycle` once per frame plus once per output).
+Because `16*i mod 32` is 0 for even and 16 for odd chains, this is exactly
+one table per output for the even chains and one for the odd chains, which
+is how the plan stores it (`lut[parity][output]`).
 
 ### 4.6 API changes
 
@@ -509,8 +534,10 @@ firmware does not call it).  `defaultPinList` is now the QuinCube list.
 | new shift clock / bit rate             | 12.8 MHz / 800 kHz |
 | FlexIO2 clock                          | 102.4 MHz from PLL5 (VCO 716.8 MHz) |
 | DMA                                    | 32 bytes per request, 1.6 M requests/s, 51 MB/s |
-| conversion buffers                     | 2 x 3 KB (6 LED bytes each) in OCRAM |
-| DMA interrupt rate                     | one per 60 us (6 LED bytes = 48 bits) |
+| conversion buffers                     | 2 x 6 KB (12 LED bytes each) in OCRAM |
+| DMA interrupt rate                     | one per 120 us (12 LED bytes = 96 bits) |
+| conversion (fill core v2)              | 93 instructions per output and column, ~1500 per LED byte column |
+| LED frame rate                         | 261 frames/s back to back; CPU load = frames/s x conversion time per frame |
 | frame (125 RGB LEDs per output)        | 3.83 ms incl. 80 us reset |
 | max bytes per output (timer 5 limit)   | 4096 (32768 bits) |
 | 595 margin at STORE                    | 39 ns each side (5 ns required) |
@@ -583,12 +610,16 @@ Library changes:
   fit in DTCM next to the rest of the firmware (RAM1 has ~170 KB free today).
   Put them in `DMAMEM` (RAM2, 505 KB free) or `EXTMEM` (PSRAM); the fill
   reads them sequentially so the cache copes.
-* CPU: conversion cost doubles (about 1.3 ms per 3.8 ms frame, ~35 percent)
-  with the new fill; acceptable, and there is room for a further 2x by
-  processing two shifts per accumulator pass.
+* CPU: conversion cost per frame doubles (32 outputs instead of 16); with
+  the second fill core (4.5) that is roughly 2 x 0.5 ms per 3.8 ms frame,
+  ~25 percent, to be measured with `cpuLoad()`.  Note that 4-bit shifts use
+  the generic read-modify-write path of the fill core; give it a
+  specialisation (constant `wordsPerBit` = 2, combine the 8 shifts of a word
+  in registers) and, since the new board has contiguous lanes, an identity
+  expand (saves 8 loads per output and column).
 * DMA interrupt rate halves for the same `BYTES_PER_DMA` (one minor loop per
-  bit instead of two); buffers grow to 6 x 8 x 8 words x 2 = 6 KB total if
-  kept at 6 LED bytes per half.
+  bit instead of two); buffers shrink to 12 x 8 x 8 words x 2 = 6 KB total
+  at 12 LED bytes per half.
 
 PCB changes: 4 x 74AHCT595 per chain (or two of the present output blocks
 daisy-chained by wiring the first block's second-595 QH' to the second
@@ -620,3 +651,50 @@ carry don't-care words) instead of two, if the PCB is ever respun anyway.
   layout, external flash and power, and either PJRC's bootloader chip (keeps
   Teensyduino) or a move to the NXP SDK; the library's pin lookup
   (`portOutputRegister`/`digitalPinToBit`) would need a pin table for it.
+
+---------------------------------------------------------------------------
+
+## 10. First hardware results and CPU load (2026-09-17)
+
+The rewrite ran on the QuinCube on the first try: LEDs correct, exact
+800 kHz.  Animations that are not CPU bound run at a higher frame rate than
+before (an LED frame takes 3.83 ms instead of 5.5 ms).  CPU bound animations
+ran slower: the Orbs animation dropped from 78 to 55 fps.
+
+Why: the conversion runs in the DMA interrupt for every LED frame, and LED
+frames are sent back to back (dithering re-sends the current frame), so it
+is a continuous background load that scales with the LED frame rate: 261
+frames/s now against 181 before, 1.44x more conversions per second.  The
+first fill core cost about as much per frame as the old `fillbits`
+(3000+ instructions per column, see 4.5), so the background load grew by
+that factor.  Solving `fps = (1 - load) / T_anim` for both measurements
+gives about 2.2 ms of conversion per LED frame (40 percent load before, 57
+percent after) and a 7.7 ms animation frame, consistent with the assembly.
+
+Fix (this version): the fill core rewrite (4.5) cuts the instruction count
+per column by 2 to 2.5x and removes the stack spilling.  Estimated load
+around 15 percent (roughly 1000 cycles per column x 375 columns x 261
+frames/s at 816 MHz plus cache maintenance), which would put Orbs at about
+100 fps.  `cpuLoad()` reports the measured percentage (DWT cycle counts
+taken in the DMA and FlexIO interrupts and in `transfer()`); measure it.
+
+Knobs if the load is still too high:
+
+* `SHIFTWS2811_RESET_US`: a longer gap lowers the LED frame rate and with it
+  the load, linearly (1750 us gives the old 181 frames/s); `setDitherBits`
+  adapts the dither depth to the frame time automatically.
+* `SHIFTWS2811_BITDATA_DTCM 1`: conversion buffers in DTCM instead of OCRAM.
+  Removes the write-allocate line fills (16 per column) and the cache flush
+  (16 lines per column), maybe a third of the remaining cost.  The eDMA then
+  reads the buffers through the core's AHBS port (RM: TCM is accessible to
+  DMA through AHBS); untested on this board, watch `underruns()`.
+* `SHIFTWS2811_BYTES_PER_DMA` (now 12, 120 us per interrupt) only changes the
+  interrupt rate; the fixed cost per interrupt is a few hundred cycles and
+  irrelevant next to the conversion, but a larger value tolerates longer
+  interrupt latency from other code.
+
+Further fill core speedups not done yet: identity expand for boards with
+contiguous lanes, loading 4 pixel columns per 32-bit read (saves 6 of 8
+pixel loads per output and column, needs 4 accumulators), and converting
+once per animation frame instead of once per LED frame (only possible
+without dithering, which changes the corrected byte every frame).

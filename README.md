@@ -51,6 +51,29 @@ The colour to bit-stream conversion (`ShiftWS2811_fill.h`) transposes 8
 chains at a time through two small lookup tables; it is hardware independent
 and has a host test in `test/host_fill_test.c`.
 
+CPU load
+--------
+
+The conversion runs in the DMA interrupt, once per LED frame.  Frames are
+sent back to back (dithering re-sends the current frame), so this is a
+continuous background load of roughly
+
+    frames per second  x  conversion time per frame
+
+i.e. 261 frames/s at 800 kHz with 125 RGB LEDs per output.  The fill core
+needs about 1500 Cortex-M7 instructions per LED byte column (128 pixel
+bytes); expect around 15 percent of an 816 MHz core for the QuinCube.
+`cpuLoad()` returns the measured percentage (DWT cycle counts of the
+library's interrupts), call it every second or so next to your fps counter.
+
+If that is too much for an animation, raise `SHIFTWS2811_RESET_US`: a longer
+gap between frames lowers the LED frame rate and the load linearly (the
+dither depth chosen by `setDitherBits(255)` follows the frame time).
+`SHIFTWS2811_BITDATA_DTCM 1` moves the conversion buffers from OCRAM to
+DTCM, which removes the cache line fills and flushes of the destination
+writes; it is untested on the board (the eDMA then reads through the core's
+AHBS port), so check `underruns()` when trying it.
+
 Timing configuration
 --------------------
 
@@ -62,12 +85,13 @@ All timing is derived at compile time from these defines (override them with
 | `SHIFTWS2811_BIT_NS`          | 1250    | WS2811 bit period (800 kHz)                          |
 | `SHIFTWS2811_T0H_NS`          | 300     | high time of a 0 bit                                 |
 | `SHIFTWS2811_DATA_NS`         | 400     | 595 output enable time; a 1 bit is high T0H + DATA   |
-| `SHIFTWS2811_RESET_US`        | 80      | low time between frames                              |
-| `SHIFTWS2811_BYTES_PER_DMA`   | 6       | LED bytes converted per DMA interrupt (x2 buffers)   |
+| `SHIFTWS2811_RESET_US`        | 80      | low time between frames (also caps the frame rate)   |
+| `SHIFTWS2811_BYTES_PER_DMA`   | 12      | LED bytes converted per DMA interrupt (x2 buffers, 6 KB each) |
 | `SHIFTWS2811_SHIFT_DIV`       | 3       | shift clock period = 2*(DIV+1) FlexIO clocks         |
 | `SHIFTWS2811_TRIGGER_LATENCY` | 1       | FlexIO clocks between a timer edge and the timer it starts |
 | `SHIFTWS2811_DMA_BURST`       | 1       | 32-byte burst source reads (0: 32-bit reads)         |
 | `SHIFTWS2811_DMA_PRIORITY`    | 1       | raise the DMA channel to the top fixed priority      |
+| `SHIFTWS2811_BITDATA_DTCM`    | 0       | 1: conversion buffers in DTCM instead of OCRAM (untested) |
 | `SHIFTWS2811_PIN_SHIFT_CLK`   | 10      | 595 SRCLK (FlexIO2 pin)                              |
 | `SHIFTWS2811_PIN_STORE`       | 11      | 595 RCLK / output enable (FlexIO2 pin)               |
 | `SHIFTWS2811_PIN_COMMON`      | 12      | COMMON_WF (FlexIO2 pin)                              |
@@ -77,14 +101,19 @@ defaults) and comes from the otherwise unused video PLL, so any bit period
 is hit exactly.  FlexIO3 shares this clock root.  Resolution of the waveform
 edges is one FlexIO clock (9.8 ns at the defaults).
 
+Buffers: the three pixel buffers hold `numPerStrip * 3 * 16` bytes per data
+pin and must be allocated for a multiple of 8 data pins (the converter reads
+the pins in groups of 8).
+
 Bringing it up on hardware
 --------------------------
 
-The library was written against the i.MX RT1060 reference manual and could
-not be tested on hardware by its author.  `docs/DESIGN.md` collects all the
-research behind it (verified board netlist, the FlexIO/eDMA/clock facts with
-manual references, the timeline, rejected alternatives and a 256-channel
-plan).  Check these with a scope on the first run:
+The library was written against the i.MX RT1060 reference manual; the first
+run on the QuinCube board (September 2026) drove the LEDs correctly.
+`docs/DESIGN.md` collects all the research behind it (verified board
+netlist, the FlexIO/eDMA/clock facts with manual references, the timeline,
+rejected alternatives, CPU load findings and a 256-channel plan).  Things
+still worth a look with a scope:
 
 1. `error()` must return 0 after `begin()`; `frames()` must count up and
    `underruns()` and `stalls()` must stay 0.  Underruns mean the DMA was late
@@ -113,4 +142,5 @@ leds.underruns();    // frames with a late DMA refill (visible as a glitch)
 leds.stalls();       // frames that never finished; show() restarted the engine
 leds.error();        // 0, or an ERR_ code from ShiftWS2811.h
 leds.frameTimeUs();  // frame + reset gap duration
+leds.cpuLoad();      // percent of CPU spent in the library since the previous call
 ```
